@@ -1,0 +1,4 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+nptdms>=1.4.0
+numpy>=1.24.0

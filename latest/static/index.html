@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AFM Logger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ─── Design tokens ──────────────────────────────────────────── */
+:root {
+  --bg:            #0d0f14;
+  --bg2:           #13161e;
+  --bg3:           #1a1e28;
+  --border:        #252a38;
+  --border-bright: #353c52;
+  --text:          #c8d0e8;
+  --text-dim:      #6a7494;
+  --text-bright:   #e8edf8;
+  --accent:        #4f8ef7;
+
+  /* PF — neon violet */
+  --pf-hue:        272;
+  --pf-color:      hsl(272, 90%, 65%);
+  --pf-bg:         hsla(272, 80%, 18%, 0.30);
+  --pf-border:     hsla(272, 80%, 55%, 0.45);
+  --pf-header-bg:  hsla(272, 80%, 14%, 0.55);
+
+  /* FV — cornflower blue */
+  --fv-hue:        225;
+  --fv-color:      hsl(225, 80%, 68%);
+  --fv-bg:         hsla(225, 70%, 18%, 0.30);
+  --fv-border:     hsla(225, 70%, 55%, 0.45);
+  --fv-header-bg:  hsla(225, 70%, 14%, 0.55);
+
+  --radius:        6px;
+  --font-mono:     'IBM Plex Mono', monospace;
+  --font-sans:     'IBM Plex Sans', sans-serif;
+  --transition:    0.18s ease;
+}
+
+/* ─── Reset & base ──────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* subtle grid background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(79,142,247,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(79,142,247,0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ─── Layout ─────────────────────────────────────────────────── */
+#app { position: relative; z-index: 1; }
+
+header {
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 0 28px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  height: 56px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.logo {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: var(--text-bright);
+  text-transform: uppercase;
+}
+.logo span { color: var(--accent); }
+
+.header-spacer { flex: 1; }
+
+/* ─── Root path bar ──────────────────────────────────────────── */
+#path-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 28px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+
+#path-bar label {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+#root-input {
+  flex: 1;
+  background: var(--bg3);
+  border: 1px solid var(--border-bright);
+  border-radius: var(--radius);
+  color: var(--text-bright);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  padding: 5px 10px;
+  outline: none;
+  transition: border-color var(--transition);
+}
+#root-input:focus { border-color: var(--accent); }
+
+/* ─── Buttons ────────────────────────────────────────────────── */
+.btn {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  padding: 5px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-bright);
+  background: var(--bg3);
+  color: var(--text);
+  cursor: pointer;
+  transition: all var(--transition);
+  white-space: nowrap;
+}
+.btn:hover {
+  border-color: var(--accent);
+  color: var(--text-bright);
+  background: rgba(79,142,247,0.10);
+}
+.btn-primary {
+  background: rgba(79,142,247,0.15);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.btn-primary:hover {
+  background: rgba(79,142,247,0.30);
+}
+.btn-save {
+  background: rgba(60,200,100,0.12);
+  border-color: rgba(60,200,100,0.5);
+  color: #4fd880;
+  font-size: 0.72rem;
+  padding: 3px 10px;
+}
+.btn-save:hover { background: rgba(60,200,100,0.22); }
+.btn-cancel {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  padding: 3px 10px;
+}
+
+/* ─── Status + stats bar ─────────────────────────────────────── */
+#stats-bar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 8px 28px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+.stat-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.stat-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+}
+.stat-dot.pf { background: var(--pf-color); box-shadow: 0 0 6px var(--pf-color); }
+.stat-dot.fv { background: var(--fv-color); box-shadow: 0 0 6px var(--fv-color); }
+#status-msg { margin-left: auto; }
+#status-msg.error { color: #f07070; }
+#status-msg.ok    { color: #4fd880; }
+
+/* ─── Filter bar ─────────────────────────────────────────────── */
+#filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 28px;
+  border-bottom: 1px solid var(--border);
+}
+#filter-bar label {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.filter-btn {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 4px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--border-bright);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all var(--transition);
+}
+.filter-btn.active-pf {
+  border-color: var(--pf-color);
+  color: var(--pf-color);
+  background: var(--pf-bg);
+}
+.filter-btn.active-fv {
+  border-color: var(--fv-color);
+  color: var(--fv-color);
+  background: var(--fv-bg);
+}
+.filter-btn.active-all {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(79,142,247,0.10);
+}
+
+/* ─── Main content ───────────────────────────────────────────── */
+#main {
+  padding: 20px 28px 60px;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+/* ─── Day group ──────────────────────────────────────────────── */
+.day-group { margin-bottom: 32px; }
+
+.day-header {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 0 0 10px 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+/* ─── Table wrapper ──────────────────────────────────────────── */
+.table-wrap {
+  overflow-x: auto;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+.table-wrap.pf { border-color: var(--pf-border); }
+.table-wrap.fv { border-color: var(--fv-border); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+/* header row */
+thead tr {
+  border-bottom: 1px solid var(--border);
+}
+.pf thead tr { background: var(--pf-header-bg); border-color: var(--pf-border); }
+.fv thead tr { background: var(--fv-header-bg); border-color: var(--fv-border); }
+
+thead th {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 8px 12px;
+  text-align: left;
+  white-space: nowrap;
+}
+.pf thead th { color: hsl(272, 60%, 70%); }
+.fv thead th { color: hsl(225, 60%, 72%); }
+
+/* data rows */
+tbody tr {
+  border-bottom: 1px solid var(--border);
+  transition: background var(--transition);
+  cursor: default;
+}
+tbody tr:last-child { border-bottom: none; }
+
+.pf tbody tr { background: var(--pf-bg); }
+.fv tbody tr { background: var(--fv-bg); }
+
+.pf tbody tr:hover { background: hsla(272, 80%, 22%, 0.45); }
+.fv tbody tr:hover { background: hsla(225, 70%, 22%, 0.45); }
+
+td {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  padding: 8px 12px;
+  color: var(--text);
+  white-space: nowrap;
+}
+td.dim { color: var(--text-dim); }
+td.val { color: var(--text-bright); }
+
+/* mode badge */
+.mode-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+}
+.mode-badge.PF {
+  background: hsla(272, 80%, 40%, 0.35);
+  color: var(--pf-color);
+  border: 1px solid var(--pf-border);
+}
+.mode-badge.FV {
+  background: hsla(225, 70%, 38%, 0.35);
+  color: var(--fv-color);
+  border: 1px solid var(--fv-border);
+}
+
+/* missing config indicator */
+.no-cfg {
+  display: inline-block;
+  font-size: 0.62rem;
+  color: #f07070;
+  border: 1px solid #f0707040;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+/* ─── Editable cells ─────────────────────────────────────────── */
+.editable {
+  cursor: pointer;
+  border-radius: 3px;
+  transition: background var(--transition);
+  padding: 2px 4px;
+  margin: -2px -4px;
+  display: inline-block;
+  min-width: 40px;
+}
+.editable:hover {
+  background: rgba(255,255,255,0.06);
+  outline: 1px dashed var(--border-bright);
+}
+.editable.empty {
+  color: var(--text-dim);
+  font-style: italic;
+  font-size: 0.72rem;
+}
+.editable.active {
+  background: rgba(79,142,247,0.15);
+  outline: 1px solid var(--accent);
+}
+
+/* ─── Comments cell ──────────────────────────────────────────── */
+.comments-cell {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Loading / empty states ─────────────────────────────────── */
+#loading, #empty {
+  text-align: center;
+  padding: 80px 20px;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--text-dim);
+}
+.spinner {
+  display: inline-block;
+  width: 20px; height: 20px;
+  border: 2px solid var(--border-bright);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  margin-right: 10px;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ─── Edit bar ───────────────────────────────────────────────── */
+#edit-bar {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: var(--bg2);
+  border-top: 1px solid var(--border-bright);
+  padding: 10px 28px;
+  display: none;
+  align-items: center;
+  gap: 12px;
+  z-index: 200;
+  box-shadow: 0 -4px 20px rgba(0,0,0,0.4);
+}
+#edit-bar.visible { display: flex; }
+#edit-bar label {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+#edit-bar strong {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--accent);
+  margin-right: 4px;
+}
+#edit-input {
+  flex: 1;
+  max-width: 400px;
+  background: var(--bg3);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--text-bright);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  padding: 6px 12px;
+  outline: none;
+}
+#edit-bar .spacer { flex: 1; }
+
+/* ─── Scrollbar ──────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg2); }
+::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">AFM <span>Logger</span></div>
+    <div class="header-spacer"></div>
+    <button class="btn btn-primary" onclick="refreshData()">⟳ Refresh</button>
+  </header>
+
+  <!-- Root path bar -->
+  <div id="path-bar">
+    <label>Data Root</label>
+    <input id="root-input" type="text" placeholder="e.g. /Volumes/DATA/シュテファン or D:\シュテファン" />
+    <button class="btn btn-primary" onclick="setRoot()">Set Path</button>
+    <button class="btn" onclick="document.getElementById('folder-picker').click()">Browse…</button>
+    <!-- webkitdirectory lets the user pick a folder; we read its path from the first file -->
+    <input id="folder-picker" type="file" webkitdirectory multiple
+           style="display:none" onchange="onFolderPicked(this)" />
+  </div>
+
+  <!-- Stats bar -->
+  <div id="stats-bar">
+    <div class="stat-chip">
+      <div class="stat-dot pf"></div>
+      <span id="pf-count">— PF</span>
+    </div>
+    <div class="stat-chip">
+      <div class="stat-dot fv"></div>
+      <span id="fv-count">— FV</span>
+    </div>
+    <span id="status-msg"></span>
+  </div>
+
+  <!-- Filter bar -->
+  <div id="filter-bar">
+    <label>Show:</label>
+    <button class="filter-btn active-all" id="filter-all"  onclick="setFilter('all')">All</button>
+    <button class="filter-btn"            id="filter-pf"   onclick="setFilter('PF')">Pulse Force</button>
+    <button class="filter-btn"            id="filter-fv"   onclick="setFilter('FV')">Force Volume</button>
+  </div>
+
+  <!-- Main content -->
+  <div id="main">
+    <div id="state-noroot" style="display:none">
+      <div style="text-align:center;padding:80px 20px;font-family:var(--font-mono);font-size:0.82rem;color:var(--text-dim)">
+        <div style="font-size:2rem;margin-bottom:16px;opacity:0.3">📂</div>
+        Set a data root path above and click <strong style="color:var(--text)">Set Path</strong>
+      </div>
+    </div>
+    <div id="loading" style="display:none"><span class="spinner"></span>Scanning…</div>
+    <div id="state-error" style="display:none;text-align:center;padding:60px 20px;font-family:var(--font-mono);font-size:0.8rem;color:#f07070"></div>
+    <div id="empty" style="display:none;text-align:center;padding:80px 20px;font-family:var(--font-mono);font-size:0.82rem;color:var(--text-dim)">
+      No PF or FV folders found under this root.<br>
+      <span style="font-size:0.72rem;opacity:0.6;margin-top:8px;display:block">
+        Expected: ROOT/PF/YYMMDD/HHMMSS_n/ and ROOT/FV/YYMMDD/SAMPLENAME/HHMMSS/<br>
+        Check the console at <a href="/api/debug" target="_blank" style="color:var(--accent)">/api/debug</a> for a directory scan.
+      </span>
+    </div>
+    <div id="tables"></div>
+  </div>
+
+  <!-- Edit bar - fixed at bottom, appears when editable cell is clicked -->
+  <div id="edit-bar">
+    <label>Editing <strong id="edit-label"></strong> for <strong id="edit-path"></strong></label>
+    <input id="edit-input" type="text" autocomplete="off" spellcheck="false" />
+    <button class="btn btn-save" id="edit-save">✓ Save</button>
+    <button class="btn btn-cancel" id="edit-cancel">✗ Cancel</button>
+    <div class="spacer"></div>
+    <span style="font-family:var(--font-mono);font-size:0.68rem;color:var(--text-dim)">Enter to save · Esc to cancel</span>
+  </div>
+</div>
+
+<script>
+// ─── State ───────────────────────────────────────────────────────────────────
+// ─── Safari-safe JSON parse ─────────────────────────────────────────────
+// Safari fetch().json() throws "invalid characters" on some responses.
+// res.text() + JSON.parse() bypasses that bug completely.
+async function safeJSON(res) {
+  const text = await res.text();
+  return JSON.parse(text);
+}
+
+let allDatasets = [];
+let currentFilter = 'all';
+
+// ─── Boot ────────────────────────────────────────────────────────────────────
+async function init() {
+  const res = await fetch('/api/root');
+  const { root } = await safeJSON(res);
+  document.getElementById('root-input').value = root || '';
+  if (root) {
+    await refreshData();
+  } else {
+    showState('noroot');
+  }
+}
+
+function showState(state) {
+  // states: 'noroot' | 'loading' | 'error' | 'empty' | 'data'
+  document.getElementById('state-noroot').style.display = state === 'noroot' ? '' : 'none';
+  document.getElementById('loading').style.display      = state === 'loading' ? '' : 'none';
+  document.getElementById('state-error').style.display  = state === 'error'   ? '' : 'none';
+  document.getElementById('empty').style.display        = state === 'empty'   ? '' : 'none';
+  document.getElementById('tables').style.display       = state === 'data'    ? '' : 'none';
+}
+
+// ─── Data fetch ───────────────────────────────────────────────────────────────
+async function refreshData() {
+  showStatus('', '');
+  showState('loading');
+  document.getElementById('tables').innerHTML = '';
+
+  try {
+    const res = await fetch('/api/datasets');
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt);
+    }
+    const body = await safeJSON(res);
+
+    if (Array.isArray(body)) {
+      allDatasets = body;
+    } else if (body.error === 'no_root') {
+      showState('noroot');
+      return;
+    } else if (body.error) {
+      document.getElementById('state-error').textContent =
+        body.error + '\n\nSee /api/scan-debug for details.';
+      showState('error');
+      showStatus(body.error, 'error');
+      return;
+    } else {
+      allDatasets = body.datasets || [];
+    }
+
+    renderAll();
+    const n = allDatasets.length;
+    showStatus(n > 0 ? `Loaded ${n} dataset(s)` : 'No datasets found', n > 0 ? 'ok' : '');
+  } catch(e) {
+    document.getElementById('state-error').textContent =
+      'Scan failed: ' + e.message;
+    showState('error');
+    showStatus('Error: ' + e.message, 'error');
+  }
+}
+
+// ─── Root path ────────────────────────────────────────────────────────────────
+async function setRoot(rootOverride) {
+  const root = rootOverride ?? document.getElementById('root-input').value.trim();
+  if (!root) return;
+  try {
+    const res = await fetch('/api/root', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root })
+    });
+    if (!res.ok) {
+      const err = await safeJSON(res).catch(() => ({}));
+      showStatus('Path error: ' + (err.detail || 'unknown'), 'error');
+      return;
+    }
+    const data = await safeJSON(res);
+    document.getElementById('root-input').value = data.root;
+    await refreshData();
+  } catch(e) {
+    showStatus('Network error: ' + e.message, 'error');
+  }
+}
+
+function onFolderPicked(input) {
+  if (!input.files || input.files.length === 0) return;
+  // Extract the folder path from the first file's webkitRelativePath
+  // webkitRelativePath = "FolderName/file.txt"
+  // We reconstruct the absolute path by stripping the relative part from the full path.
+  // Browsers expose file.path on some platforms (Electron/Chrome desktop).
+  // Otherwise we fall back to asking the user to confirm the folder name.
+  const firstFile = input.files[0];
+  let folderPath = null;
+
+  // Chrome on macOS/Windows exposes file.path (full absolute path)
+  if (firstFile.path) {
+    // Strip the relative part to get the root folder
+    const rel = firstFile.webkitRelativePath; // e.g. "シュテファン/PF/250314/config.txt"
+    const topFolder = rel.split('/')[0];
+    const idx = firstFile.path.lastIndexOf(topFolder + '/') ;
+    if (idx !== -1) {
+      folderPath = firstFile.path.substring(0, idx + topFolder.length);
+    } else {
+      folderPath = firstFile.path.replace('/' + rel, '').replace(rel, '');
+    }
+  }
+
+  if (folderPath) {
+    document.getElementById('root-input').value = folderPath;
+    setRoot(folderPath);
+  } else {
+    // Fallback: show the top-level folder name and let user edit the full path
+    const rel = firstFile.webkitRelativePath;
+    const topFolder = rel.split('/')[0];
+    showStatus(`Folder selected: "${topFolder}" — please verify or type the full path above, then click Set Path`, '');
+    document.getElementById('root-input').placeholder = topFolder;
+    document.getElementById('root-input').focus();
+  }
+  // Reset so the same folder can be picked again
+  input.value = '';
+}
+
+// ─── Filter ───────────────────────────────────────────────────────────────────
+function setFilter(f) {
+  currentFilter = f;
+  ['all','pf','fv'].forEach(id => {
+    const el = document.getElementById('filter-' + id);
+    el.className = 'filter-btn';
+  });
+  const activeClass = f === 'all' ? 'active-all' : (f === 'PF' ? 'active-pf' : 'active-fv');
+  document.getElementById('filter-' + f.toLowerCase()).classList.add(activeClass);
+  renderAll();
+}
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+function renderAll() {
+  const container = document.getElementById('tables');
+  container.innerHTML = '';
+
+  const filtered = currentFilter === 'all'
+    ? allDatasets
+    : allDatasets.filter(d => d.mode === currentFilter);
+
+  // Update counts
+  const pfN = allDatasets.filter(d => d.mode === 'PF').length;
+  const fvN = allDatasets.filter(d => d.mode === 'FV').length;
+  document.getElementById('pf-count').textContent = pfN + ' PF';
+  document.getElementById('fv-count').textContent = fvN + ' FV';
+
+  if (filtered.length === 0) {
+    showState('empty');
+    return;
+  }
+  showState('data');
+
+  // Group by date
+  const byDate = {};
+  filtered.forEach(d => {
+    const key = d.date || 'Unknown Date';
+    if (!byDate[key]) byDate[key] = [];
+    byDate[key].push(d);
+  });
+
+  // Render day groups (newest date first — already sorted from server)
+  const dates = Object.keys(byDate); // preserve server order (newest first)
+  dates.forEach(date => {
+    const group = byDate[date];
+    const dayDiv = document.createElement('div');
+    dayDiv.className = 'day-group';
+
+    const hdr = document.createElement('div');
+    hdr.className = 'day-header';
+    hdr.textContent = formatDate(date) + '  ·  ' + group.length + ' measurement' + (group.length !== 1 ? 's' : '');
+    dayDiv.appendChild(hdr);
+
+    // Split into consecutive mode blocks
+    const blocks = makeBlocks(group);
+    blocks.forEach(block => {
+      dayDiv.appendChild(renderTable(block));
+    });
+
+    container.appendChild(dayDiv);
+  });
+}
+
+// Group consecutive same-mode measurements into blocks
+function makeBlocks(group) {
+  const blocks = [];
+  let cur = null;
+  group.forEach(d => {
+    if (!cur || cur.mode !== d.mode) {
+      cur = { mode: d.mode, rows: [] };
+      blocks.push(cur);
+    }
+    cur.rows.push(d);
+  });
+  return blocks;
+}
+
+function renderTable(block) {
+  const wrap = document.createElement('div');
+  wrap.className = 'table-wrap ' + block.mode.toLowerCase();
+  const table = document.createElement('table');
+  table.className = block.mode.toLowerCase();
+
+  const rows = block.mode === 'PF' ? buildPFRows(block.rows) : buildFVRows(block.rows);
+  rows.forEach(r => table.appendChild(r));
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function makeHead(ths) {
+  const thead = document.createElement('thead');
+  const tr = document.createElement('tr');
+  ths.forEach(t => { const th = document.createElement('th'); th.textContent = t; tr.appendChild(th); });
+  thead.appendChild(tr);
+  return thead;
+}
+
+function makeTd(content, cls) {
+  const td = document.createElement('td');
+  if (cls) td.className = cls;
+  if (content instanceof Node) td.appendChild(content);
+  else td.innerHTML = content;
+  return td;
+}
+
+function makeEditable(d, field, value, placeholder) {
+  const span = document.createElement('span');
+  span.className = 'editable' + (!value ? ' empty' : '');
+  span.id = cellId(d.folder, field);
+  span.dataset.folder      = d.folder;
+  span.dataset.mode        = d.mode;
+  span.dataset.field       = field;
+  span.dataset.value       = value || '';
+  span.dataset.placeholder = placeholder;
+  if (value) span.textContent = value;
+  else { const em = document.createElement('em'); em.className = 'empty'; em.textContent = placeholder; span.appendChild(em); }
+  span.addEventListener('click', () => openEditBar(span));
+  return span;
+}
+
+function buildPFRows(rows) {
+  const els = [];
+  els.push(makeHead(['Mode','Time','ID','Cantilever','Freq (Hz)','U_amp (V)','U_trig (V)','X×Y (μm)','Steps X×Y','n / FC','Comments']));
+  const tbody = document.createElement('tbody');
+  rows.forEach(d => {
+    const tr = document.createElement('tr');
+    tr.dataset.folder = d.folder;
+    tr.dataset.mode   = 'PF';
+    const badge = document.createElement('span');
+    badge.className = 'mode-badge PF'; badge.textContent = 'PF';
+    const cell0 = makeTd(badge);
+    if (!d.has_config) { const nc = document.createElement('span'); nc.className='no-cfg'; nc.textContent='no cfg'; cell0.appendChild(nc); }
+    tr.appendChild(cell0);
+    tr.appendChild(makeTd(d.time||'—', 'dim'));
+    tr.appendChild(makeTd(esc(d.meas_id||'—'), 'val'));
+    tr.appendChild(makeTd(makeEditable(d,'cantilever',d.cantilever,'AC160…')));
+    tr.appendChild(makeTd(fmtN(d.frequency_hz), 'val'));
+    tr.appendChild(makeTd(fmtN(d.u_amplitude,3), 'val'));
+    tr.appendChild(makeTd(fmtN(d.u_trigger,3), 'val'));
+    tr.appendChild(makeTd(fmtXY(d.x_length,d.y_length), 'val'));
+    tr.appendChild(makeTd(fmtXY(d.x_step,d.y_step), 'val'));
+    tr.appendChild(makeTd(d.n_samples!=null?String(d.n_samples):'—', 'val'));
+    tr.appendChild(makeTd(makeEditable(d,'comments',d.comments,'Add note…'), 'comments-cell'));
+    tbody.appendChild(tr);
+  });
+  els.push(tbody);
+  return els;
+}
+
+function buildFVRows(rows) {
+  const els = [];
+  els.push(makeHead(['Mode','Time','Sample Name','Cantilever','U_trig (V)','Speed (app/ret)','X×Y (μm)','Steps X×Y','n App / Ret','Vel app/ret (nm/s)','Comments']));
+  const tbody = document.createElement('tbody');
+  rows.forEach(d => {
+    const tr = document.createElement('tr');
+    tr.dataset.folder = d.folder;
+    tr.dataset.mode   = 'FV';
+    const badge = document.createElement('span');
+    badge.className = 'mode-badge FV'; badge.textContent = 'FV';
+    const cell0 = makeTd(badge);
+    if (!d.has_config) { const nc = document.createElement('span'); nc.className='no-cfg'; nc.textContent='no cfg'; cell0.appendChild(nc); }
+    tr.appendChild(cell0);
+    tr.appendChild(makeTd(d.time||'—', 'dim'));
+    tr.appendChild(makeTd(makeEditable(d,'sample_name',d.sample_name,'Sample…')));
+    tr.appendChild(makeTd(makeEditable(d,'cantilever',d.cantilever,'AC160…')));
+    tr.appendChild(makeTd(fmtN(d.u_trigger,3), 'val'));
+    const speed = (d.app_speed!=null&&d.ret_speed!=null) ? fmtN(d.app_speed,2)+' / '+fmtN(d.ret_speed,2) : '—';
+    tr.appendChild(makeTd(speed, 'dim'));
+    tr.appendChild(makeTd(fmtXY(d.x_length,d.y_length), 'val'));
+    tr.appendChild(makeTd(fmtXY(d.x_step,d.y_step), 'val'));
+    const nSamples = (d.num_approach!=null&&d.num_retract!=null) ? d.num_approach+' / '+d.num_retract : '—';
+    tr.appendChild(makeTd(nSamples, 'dim'));
+    const vel = d.velocity_app!=null ? fmtN(d.velocity_app,0)+' / '+fmtN(d.velocity_ret,0) : '—';
+    tr.appendChild(makeTd(vel, 'dim'));
+    tr.appendChild(makeTd(makeEditable(d,'comments',d.comments,'Add note…'), 'comments-cell'));
+    tbody.appendChild(tr);
+  });
+  els.push(tbody);
+  return els;
+}
+
+
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+function fmtN(v, decimals=1) {
+  if (v == null) return '—';
+  return Number(v).toFixed(decimals);
+}
+
+function fmtXY(x, y) {
+  if (x == null && y == null) return '—';
+  return fmtN(x) + ' × ' + fmtN(y);
+}
+
+function formatDate(iso) {
+  if (!iso || iso === 'Unknown Date') return iso;
+  try {
+    const d = new Date(iso + 'T12:00:00');
+    return d.toLocaleDateString('en-US', { weekday:'short', year:'numeric', month:'short', day:'numeric' });
+  } catch { return iso; }
+}
+
+function fieldPlaceholder(field) {
+  const map = { cantilever:'AC160…', comments:'Add note…', sample_name:'Sample name…' };
+  return map[field] || '—';
+}
+
+function cellId(folder, field) {
+  const s = folder + '|' + field;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(31, h) + s.charCodeAt(i) | 0;
+  }
+  return 'cell_' + (h >>> 0).toString(36) + '_' + field.replace(/[^a-z]/g, '');
+}
+
+function showStatus(msg, cls) {
+  const el = document.getElementById('status-msg');
+  el.textContent = msg;
+  el.className = cls;
+}
+
+// ─── Filter ───────────────────────────────────────────────────────────────────
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+init();
+
+// ─── Edit bar ────────────────────────────────────────────────────────────────
+let _editEl = null;
+
+function openEditBar(span) {
+  if (_editEl && _editEl !== span) _editEl.classList.remove('active');
+  _editEl = span;
+  span.classList.add('active');
+  document.getElementById('edit-label').textContent = span.dataset.field.replace(/_/g, ' ');
+  const parts = span.dataset.folder.split('/');
+  document.getElementById('edit-path').textContent = parts.slice(-2).join('/');
+  const inp = document.getElementById('edit-input');
+  inp.value = span.dataset.value || '';
+  inp.placeholder = span.dataset.placeholder || '';
+  document.getElementById('edit-bar').classList.add('visible');
+  inp.focus();
+  inp.select();
+}
+
+function closeEditBar() {
+  if (_editEl) _editEl.classList.remove('active');
+  _editEl = null;
+  document.getElementById('edit-bar').classList.remove('visible');
+  document.getElementById('edit-input').value = '';
+}
+
+async function saveEditBar() {
+  if (!_editEl) return;
+  const span   = _editEl;
+  const newVal = document.getElementById('edit-input').value.trim();
+  const folder = span.dataset.folder;
+  const mode   = span.dataset.mode;
+  const field  = span.dataset.field;
+  span.dataset.value = newVal;
+  span.className = 'editable' + (!newVal ? ' empty' : '');
+  if (newVal) {
+    span.textContent = newVal;
+  } else {
+    span.innerHTML = '';
+    const em = document.createElement('em');
+    em.className = 'empty';
+    em.textContent = span.dataset.placeholder || '—';
+    span.appendChild(em);
+  }
+  closeEditBar();
+  try {
+    const res = await fetch('/api/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder, mode, updates: { [field]: newVal } })
+    });
+    if (!res.ok) {
+      const err = await safeJSON(res);
+      showStatus('Save error: ' + (err.detail || 'unknown'), 'error');
+      return;
+    }
+    const data = await safeJSON(res);
+    showStatus('Saved ✓', 'ok');
+    const ds = allDatasets.find(d => d.folder === folder);
+    if (ds) {
+      ds[field] = newVal;
+      if (data.new_folder && data.new_folder !== folder) {
+        ds.folder = data.new_folder;
+        const row = span.closest('tr');
+        if (row) row.querySelectorAll('[data-folder]').forEach(c => { c.dataset.folder = data.new_folder; });
+      }
+      if (data.now_filled && !ds.has_config) {
+        ds.has_config = true;
+        const row = span.closest('tr');
+        if (row) { const b = row.querySelector('.no-cfg'); if (b) b.remove(); }
+      }
+    }
+    setTimeout(() => showStatus('', ''), 2500);
+  } catch(e) { showStatus('Network error: ' + e.message, 'error'); }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('edit-save').addEventListener('click', saveEditBar);
+  document.getElementById('edit-cancel').addEventListener('click', closeEditBar);
+  document.getElementById('edit-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter')  { e.preventDefault(); saveEditBar(); }
+    if (e.key === 'Escape') { e.preventDefault(); closeEditBar(); }
+  });
+});
+
+</script>
+</body>
+</html>
