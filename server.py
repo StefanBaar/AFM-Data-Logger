@@ -488,13 +488,33 @@ def get_maps(folder: str):
             if n_samp > 0:
                 result["n_curves"] = n_pts
 
-                # Read full channels once, reshape to (n_pts, n_samp)
-                D  = _np.array(chs[0][:n_pts * n_samp]).reshape(n_pts, n_samp)
-                Zs = _np.array(chs[2][:n_pts * n_samp]).reshape(n_pts, n_samp)
+                # Read approach half only (first n_samp//2 samples per FC)
+                # Z goes low->high->low; approach = first half (increasing Z)
+                half   = n_samp // 2
+                total  = n_pts * n_samp
+                D_all  = _np.array(chs[0][:total]).reshape(n_pts, n_samp)
+                Z_all  = _np.array(chs[1][:total]).reshape(n_pts, n_samp)
+                D_app  = D_all[:, :half]
+                Z_app  = Z_all[:, :half]
 
-                result["maps"]["D_max"]   = gridmap(D.max(axis=1))
-                result["maps"]["D_min"]   = gridmap(D.min(axis=1))
-                result["maps"]["Zs_range"]= gridmap(Zs.max(axis=1) - Zs.min(axis=1))
+                # ── Contact point detection ────────────────────────────────────
+                # Baseline = first 20% of approach; CP = first index where
+                # D exceeds baseline + 5*sigma.
+                # flat curve (no contact): CP = Z_app.max()
+                # already in contact:      CP = Z_app[:,0]
+                n_base = max(5, half // 5)
+                b_mean = D_app[:, :n_base].mean(axis=1, keepdims=True)
+                b_std  = D_app[:, :n_base].std(axis=1, keepdims=True).clip(min=1e-6)
+                above  = D_app > (b_mean + 5 * b_std)
+
+                any_above  = above.any(axis=1)
+                first_idx  = _np.where(any_above, above.argmax(axis=1), half - 1)
+                rows       = _np.arange(n_pts)
+                cp_z       = Z_app[rows, first_idx]
+                cp_z[~any_above]   = Z_app[~any_above].max(axis=1)   # no contact
+                cp_z[above[:, 0]]  = Z_app[above[:, 0], 0]           # full contact
+
+                result["maps"]["CP"] = gridmap(cp_z)
         except Exception as e:
             pass   # maps still returned without TDMS-derived ones
 
