@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
@@ -50,6 +50,78 @@ def _safe_json(data) -> Response:
 
 # ── Multiprocessing worker (must be at module level to be picklable) ───────────
 
+def _fv_worker(args) -> tuple:
+    """Process one FV LVM file: load, pre_process, get_E.
+    args = (lvm_path_str, idx, INVOLS, StIV, k, ran, th, sample, nu, alpha)
+    Returns (idx, zm, ds, cp, E)
+    """
+    try:
+        import numpy as _np
+        from scipy import signal as _sig
+        from pathlib import Path as _P
+        lvm_path, idx, INVOLS, StIV, k, ran, th, sample, nu, alpha = args
+
+        # Fast LVM load
+        raw = open(lvm_path, 'rb').read().split()
+        n = len(raw) // 2
+        D = _np.array(raw[:n],   dtype=_np.float32)
+        Z = _np.array(raw[n:2*n], dtype=_np.float32)
+
+        # Downsample
+        d, z = D[::sample], Z[::sample]
+        z = z * StIV
+        base_n = max(1, len(d) // ran)
+
+        # Tilt correction + baseline
+        try:
+            slope = _np.polyfit(z[:base_n], d[:base_n], 1)[0]
+        except Exception:
+            slope = 0.0
+        d = d - slope * z
+        d = (d - _np.median(d[:base_n])) * INVOLS
+        sig = _np.std(d[:base_n]) * th
+
+        # Find contact point on approach
+        dmax = int(_np.argmax(d))
+        dm, zm = d[:dmax], z[:dmax]
+
+        if len(dm) >= 53:
+            ds = _np.array(_sig.savgol_filter(dm, 51, 11), dtype=_np.float32)
+        else:
+            ds = dm.copy()
+
+        below = _np.argwhere(ds < sig)
+        cp = int(below[-1][0]) if len(below) else max(0, len(zm) - 1)
+
+        # Young's modulus via Sneddon
+        E_val = _np.nan
+        if cp < len(zm) - 3:
+            import math as _math
+            Delta_m = (zm[cp:] - zm[cp]) * 1e-6   # um → m
+            F_N     = (ds[cp:] - ds[cp]) * k * 1e-6  # um * N/m → N... wait
+            # ds is in um (INVOLS converts V→um), k is N/m
+            # F [N] = deflection [m] * k [N/m] = ds[um] * 1e-6 * k
+            fmax = int(_np.argmax(F_N))
+            if fmax >= 3:
+                d2 = Delta_m[:fmax] ** 2
+                mask = d2 > 0
+                if mask.sum() >= 3:
+                    try:
+                        alpha_r = _math.radians(alpha)
+                        slope_s, _ = _np.polyfit(d2[mask], F_N[:fmax][mask], 1)
+                        E_val = float(slope_s * _math.pi * (1 - nu**2) /
+                                      (2 * _math.tan(alpha_r)))
+                        if E_val < 0: E_val = _np.nan
+                    except Exception:
+                        pass
+
+        zm_f = _np.array(zm, dtype=_np.float32)
+        ds_f = _np.array(ds, dtype=_np.float32)
+        return (idx, zm_f, ds_f, int(cp), float(E_val))
+    except Exception as e:
+        return (args[1], _np.array([]), _np.array([]), 0, float('nan'))
+
+
 def _stage_worker(folder_str: str) -> tuple:
     """Run scan_tdms_stage in a subprocess. Returns (folder_str, result_dict)."""
     try:
@@ -57,6 +129,8 @@ def _stage_worker(folder_str: str) -> tuple:
         sys.path.insert(0, str(_Path(__file__).parent))
         from afm_io import scan_tdms_stage as _scan
         result = _scan(_Path(folder_str))
+        try: _compute_and_cache_maps(_Path(folder_str))
+        except Exception: pass
         return (folder_str, result)
     except Exception as e:
         return (folder_str, {})
@@ -71,6 +145,134 @@ from afm_io import (discover_all, update_dataset_meta,
                      parse_pf_config, parse_fv_config,
                      load_comments, scan_tdms_stage,
                      _dataset_is_filled, _create_nan_config)
+
+
+_sensor_cache: dict = {}   # folder -> (xs, ys)
+_tdms_cache:   dict = {}   # folder -> (D, Z, Zs, n_samp, mtime)
+_maps_cache:   dict = {}   # folder -> (result_dict, mtime)  — skip recompute on re-expand
+
+
+def _load_tdms_arrays(meas: Path):
+    """Return (D, Z, n_samp) numpy arrays, cached in memory.
+    Cache is invalidated automatically when the TDMS file is modified.
+    Returns (None, None, None) if the file is missing or unreadable.
+    """
+    import numpy as _np
+    tdms_path = meas / "ForceCurve.tdms"
+    if not tdms_path.exists():
+        return None, None, None, None
+    key   = str(meas)
+    mtime = tdms_path.stat().st_mtime
+    if key in _tdms_cache and _tdms_cache[key][4] == mtime:
+        D, Z, Zs, n_samp, _ = _tdms_cache[key]
+        return D, Z, Zs, n_samp
+    try:
+        from nptdms import TdmsFile as _TF
+        import re as _re
+        import tempfile as _tmp, shutil as _sh
+        _mmap = _tmp.mkdtemp(prefix="afm_mm_")
+        try:
+            tdms = _TF.read(str(tdms_path), memmap_dir=_mmap)
+        except Exception:
+            tdms = _TF.read(str(tdms_path))
+        chs  = tdms["Forcecurve"].channels()
+        D    = _np.array(chs[0][:], dtype=_np.float32)  # Deflection
+        Z    = _np.array(chs[1][:], dtype=_np.float32)  # ZTip_input
+        Zs   = _np.array(chs[2][:], dtype=_np.float32) if len(chs)>2 else _np.array([], dtype=_np.float32)
+        try: _sh.rmtree(_mmap, ignore_errors=True)
+        except Exception: pass
+        # n_samp from config
+        n_samp = 500
+        cfg = meas / "config.txt"
+        if cfg.exists():
+            m = _re.search(r"FCあたりのデータ取得点数:\s*([0-9]+)",
+                           cfg.read_text(encoding="utf-8", errors="replace"))
+            if m: n_samp = int(m.group(1))
+        _tdms_cache[key] = (D, Z, Zs, n_samp, mtime)
+        return D, Z, Zs, n_samp
+    except Exception:
+        return None, None, None, None
+
+
+def _compute_and_cache_maps(meas) -> bool:
+    """Pre-compute CP + sensor maps, save as meas/afm_maps.npz.
+    Called from Phase 2 worker so maps are instant on first row expand.
+    Returns True if cache was written or already valid.
+    """
+    import numpy as _np
+    from scipy.interpolate import griddata as _gd
+    from pathlib import Path as _P
+    meas = _P(meas)
+    npz  = meas / "afm_maps.npz"
+    tdms = meas / "ForceCurve.tdms"
+    if not tdms.exists(): return False
+    if npz.exists() and npz.stat().st_mtime >= tdms.stat().st_mtime:
+        return True  # already fresh
+    xs, ys = _load_sensors(meas)
+    if xs is None: return False
+    n_pts  = len(xs)
+    D_all, Z_all, _Zs, n_samp = _load_tdms_arrays(meas)
+    if D_all is None or n_samp == 0: return False
+    GRID   = min(100, max(10, int(_np.sqrt(n_pts))))
+    xi = _np.linspace(xs.min(), xs.max(), GRID)
+    yi = _np.linspace(ys.min(), ys.max(), GRID)
+    Xi, Yi = _np.meshgrid(xi, yi)
+    pts = (xs, ys)
+    half  = n_samp // 2
+    D_app = D_all[:n_pts*n_samp].reshape(n_pts, n_samp)[:, :half]
+    Z_app = Z_all[:n_pts*n_samp].reshape(n_pts, n_samp)[:, :half]
+    n_base = max(5, half//5)
+    bm = D_app[:, :n_base].mean(axis=1, keepdims=True)
+    bs = D_app[:, :n_base].std(axis=1,  keepdims=True).clip(min=1e-6)
+    above = D_app > (bm + 5*bs)
+    any_a = above.any(axis=1)
+    fi    = _np.where(any_a, above.argmax(axis=1), half-1)
+    cp    = Z_app[_np.arange(n_pts), fi].copy()
+    cp[~any_a]    = Z_app[~any_a].max(axis=1)
+    cp[above[:,0]]= Z_app[above[:,0], 0]
+    cp_grid = _gd(pts, cp, (Xi, Yi), method="nearest").astype(_np.float32)
+    arrays  = {"cp": cp_grid,
+               "xi": xi.astype(_np.float32), "yi": yi.astype(_np.float32),
+               "x_raw": xs.astype(_np.float32), "y_raw": ys.astype(_np.float32),
+               "grid_n": _np.array([GRID], dtype=_np.int32)}
+    for fname, key in [("ZSamplePID.txt","zpid"), ("ZTipoffsets.txt","ztip")]:
+        p = meas / fname
+        if p.exists():
+            try:
+                v = _fast_load_txt(p).astype(_np.float32)
+                if len(v)==n_pts:
+                    arrays[key] = _gd(pts, v, (Xi,Yi), method="nearest").astype(_np.float32)
+            except Exception: pass
+    try:
+        _np.savez_compressed(str(npz), **arrays)
+        return True
+    except Exception:
+        return False
+
+
+def _load_sensors(meas):
+    """Load Xsensors.txt / Ysensors.txt with in-memory caching."""
+    import numpy as _np
+    key = str(meas)
+    if key in _sensor_cache:
+        return _sensor_cache[key]
+    xf = meas / "Xsensors.txt"
+    yf = meas / "Ysensors.txt"
+    if not xf.exists() or not yf.exists():
+        return None, None
+    xs = _fast_load_txt(xf)
+    ys = _fast_load_txt(yf)
+    _sensor_cache[key] = (xs, ys)
+    return xs, ys
+
+
+def _fast_load_txt(path) -> "_np.ndarray":
+    """Load a single-column or whitespace-delimited text file 90x faster than np.loadtxt."""
+    import numpy as _np
+    data = open(str(path), 'rb').read().split()
+    return _np.array(data, dtype=float)
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  App + static files
@@ -278,7 +480,7 @@ def scan_stream():
                 yield ev({"type":"stage_done"})
                 return
 
-            n_cores = max(1, os.cpu_count() // 2)
+            n_cores = max(1, round((os.cpu_count() or 1) * 0.8))
             yield ev({"type":"progress","done":0,"total":total2,"phase":2,
                       "label":f"Reading TDMS stage data ({n_cores} cores)…"})
 
@@ -295,7 +497,7 @@ def scan_stream():
                                   "u_max":result.get("u_max"),
                                   "u_min":result.get("u_min")})
                     yield ev({"type":"progress","done":done2,"total":total2,"phase":2,
-                              "label":Path(folder_str).name})
+                              "label":f"{Path(folder_str).name} — U_PID/U_err/U_Smax/U_Smin"})
 
             yield ev({"type":"stage_done"})
 
@@ -425,19 +627,57 @@ def get_maps(folder: str):
     if not meas.exists():
         raise HTTPException(status_code=404, detail=f"Folder not found: {folder}")
 
+    # Return cached map result if TDMS/sensor files unchanged
+    _map_mtime = 0
+    for _fn in ["ForceCurve.tdms","Xsensors.txt","Ysensors.txt","ZSamplePID.txt","ZTipoffsets.txt"]:
+        _fp = meas / _fn
+        if _fp.exists(): _map_mtime = max(_map_mtime, _fp.stat().st_mtime)
+    _map_key = str(meas)
+    if _map_key in _maps_cache and _maps_cache[_map_key][1] == _map_mtime:
+        return _safe_json(_maps_cache[_map_key][0])
+
+    import time as _time, numpy as _np2
+    _ts = _time.time()
+
     result = {"folder": folder, "maps": {}, "n_curves": None,
-              "x_coords": None, "y_coords": None}
+              "x_coords": None, "y_coords": None, "timings": {}}
 
-    # ── Read spatial positions ────────────────────────────────────────────────
-    x_path = meas / "Xsensors.txt"
-    y_path = meas / "Ysensors.txt"
-    if not x_path.exists() or not y_path.exists():
-        return _safe_json(result)
+    # ── Fast path: pre-computed .npz ─────────────────────────────────────────
+    _npz = meas / "afm_maps.npz"
+    _tdms2 = meas / "ForceCurve.tdms"
+    if (_npz.exists() and
+            (not _tdms2.exists() or _npz.stat().st_mtime >= _tdms2.stat().st_mtime)):
+        try:
+            npz = _np2.load(str(_npz))
+            GRID2 = int(npz["grid_n"][0])
+            def _nm(arr):
+                flat=[round(float(v),4) for v in arr.ravel()]
+                return {"data":flat,"rows":GRID2,"cols":GRID2,"n":len(flat),
+                        "vmin":round(float(arr.min()),4),"vmax":round(float(arr.max()),4)}
+            if "cp"   in npz.files: result["maps"]["CP"]             = _nm(npz["cp"])
+            if "zpid" in npz.files: result["maps"]["ZSamplePID.txt"] = _nm(npz["zpid"])
+            if "ztip" in npz.files: result["maps"]["ZTipoffsets.txt"]= _nm(npz["ztip"])
+            result["n_curves"] = len(npz["x_raw"])
+            result["x_coords"] = [round(float(v),4) for v in npz["xi"].tolist()]
+            result["y_coords"] = [round(float(v),4) for v in npz["yi"].tolist()]
+            result["x_raw"]    = [round(float(v),4) for v in npz["x_raw"].tolist()]
+            result["y_raw"]    = [round(float(v),4) for v in npz["y_raw"].tolist()]
+            result["grid_n"]   = GRID2
+            result["timings"]["npz_load"] = round((_time.time()-_ts)*1000)
+            _maps_cache[_map_key] = (result, _map_mtime)
+            return _safe_json(result)
+        except Exception:
+            pass
 
-    try:
-        xs = _np.loadtxt(str(x_path)).ravel()
-        ys = _np.loadtxt(str(y_path)).ravel()
-    except Exception:
+    result["timings"]["npz_miss"] = round((_time.time()-_ts)*1000)
+    _ts = _time.time()
+
+    # ── Slow path: compute from raw files ─────────────────────────────────────
+    xs, ys = _load_sensors(meas)
+    result["timings"]["load_sensors"] = round((_time.time()-_ts)*1000)
+    _ts = _time.time()
+    if xs is None:
+        _maps_cache[_map_key] = (result, _map_mtime)
         return _safe_json(result)
 
     n_pts = len(xs)
@@ -470,32 +710,26 @@ def get_maps(folder: str):
         if not p.exists():
             continue
         try:
-            vals = _np.loadtxt(str(p)).ravel()
+            vals = _fast_load_txt(p)
             if len(vals) == n_pts:
                 result["maps"][fname] = gridmap(vals)
         except Exception:
             pass
 
+    result["timings"]["sensor_maps"] = round((_time.time()-_ts)*1000)
+    _ts = _time.time()
+
     # ── TDMS force curve maps ─────────────────────────────────────────────────
-    tdms_path = meas / "ForceCurve.tdms"
-    if tdms_path.exists():
+    if (meas / "ForceCurve.tdms").exists():
         try:
-            from nptdms import TdmsFile as _TF
-            tdms  = _TF.open(str(tdms_path))
-            chs   = tdms["Forcecurve"].channels()
-            n_samp = len(chs[0][:]) // n_pts   # samples per FC
-
-            if n_samp > 0:
+            D_all, Z_all, _Zs, n_samp = _load_tdms_arrays(meas)
+            if D_all is not None and n_samp > 0:
                 result["n_curves"] = n_pts
-
-                # Read approach half only (first n_samp//2 samples per FC)
-                # Z goes low->high->low; approach = first half (increasing Z)
-                half   = n_samp // 2
-                total  = n_pts * n_samp
-                D_all  = _np.array(chs[0][:total]).reshape(n_pts, n_samp)
-                Z_all  = _np.array(chs[1][:total]).reshape(n_pts, n_samp)
-                D_app  = D_all[:, :half]
-                Z_app  = Z_all[:, :half]
+                half  = n_samp // 2
+                D_all = D_all[:n_pts * n_samp].reshape(n_pts, n_samp)
+                Z_all = Z_all[:n_pts * n_samp].reshape(n_pts, n_samp)
+                D_app = D_all[:, :half]
+                Z_app = Z_all[:, :half]
 
                 # ── Contact point detection ────────────────────────────────────
                 # Baseline = first 20% of approach; CP = first index where
@@ -515,16 +749,23 @@ def get_maps(folder: str):
                 cp_z[above[:, 0]]  = Z_app[above[:, 0], 0]           # full contact
 
                 result["maps"]["CP"] = gridmap(cp_z)
-        except Exception as e:
-            pass   # maps still returned without TDMS-derived ones
+        except Exception:
+            pass   # CP map skipped on error
+
+    result["timings"]["tdms_cp"] = round((_time.time()-_ts)*1000)
 
     # ── Grid axis coords (for crosshair position) ─────────────────────────────
-    result["x_coords"] = [round(float(v), 6) for v in xi.tolist()]
-    result["y_coords"] = [round(float(v), 6) for v in yi.tolist()]
-    result["x_raw"]    = [round(float(v), 6) for v in xs.tolist()]
-    result["y_raw"]    = [round(float(v), 6) for v in ys.tolist()]
+    # Use float32 precision (4 sig figs) — sensor positions don't need 6 decimals
+    result["x_coords"] = [round(float(v), 4) for v in xi.tolist()]
+    result["y_coords"] = [round(float(v), 4) for v in yi.tolist()]
+    result["x_raw"]    = [round(float(v), 4) for v in xs.tolist()]
+    result["y_raw"]    = [round(float(v), 4) for v in ys.tolist()]
     result["grid_n"]   = GRID
 
+    # Save npz cache so next expand is fast
+    try: _compute_and_cache_maps(meas)
+    except Exception: pass
+    _maps_cache[_map_key] = (result, _map_mtime)
     return _safe_json(result)
 
 
@@ -541,52 +782,344 @@ def get_fc(folder: str, index: int = 0):
         raise HTTPException(status_code=404, detail="ForceCurve.tdms not found")
 
     try:
-        from nptdms import TdmsFile as _TF
         import numpy as _np
 
-        # n_samples from config
-        n_samples = 500
-        cfg_path = meas / "config.txt"
-        if cfg_path.exists():
-            import re as _re
-            text = cfg_path.read_text(encoding="utf-8", errors="replace")
-            m = _re.search(r"FCあたりのデータ取得点数:\s*([0-9]+)", text)
-            if m: n_samples = int(m.group(1))
+        # Use cached TDMS arrays — no re-open on every slider move
+        D_arr, Z_arr, Zs_arr, n_samp = _load_tdms_arrays(meas)
+        if D_arr is None:
+            raise HTTPException(status_code=500, detail="Could not read TDMS channels")
 
-        tdms = _TF.open(str(tdms_path))
-        chs  = tdms["Forcecurve"].channels()
-        total = len(chs[0][:])
-        n_curves = max(1, total // n_samples)
+        n_curves = max(1, len(D_arr) // n_samp)
         idx = max(0, min(index, n_curves - 1))
-        s, e = idx * n_samples, (idx + 1) * n_samples
+        s, e = idx * n_samp, (idx + 1) * n_samp
 
         def clean(arr):
-            return [None if (_math.isnan(v) or _math.isinf(v)) else round(float(v), 6)
-                    for v in _np.array(arr)]
+            return [None if (_math.isnan(float(v)) or _math.isinf(float(v))) else round(float(v), 6)
+                    for v in arr]
 
-        d  = clean(chs[0][s:e])   # Deflection
-        z  = clean(chs[1][s:e])   # ZTip_input
-        zs = clean(chs[2][s:e])   # ZSensor
+        d  = clean(D_arr[s:e])
+        z  = clean(Z_arr[s:e])
+        zs = clean(Zs_arr[s:e]) if len(Zs_arr) > e else []
 
-        # Raw sensor position for this FC index
+        # Sensor position (cached)
         x_pos, y_pos = None, None
-        xf = meas / "Xsensors.txt"
-        yf = meas / "Ysensors.txt"
-        if xf.exists() and yf.exists():
-            try:
-                xs = _np.loadtxt(str(xf)).ravel()
-                ys = _np.loadtxt(str(yf)).ravel()
-                if idx < len(xs):
-                    x_pos = round(float(xs[idx]), 6)
-                    y_pos = round(float(ys[idx]), 6)
-            except Exception:
-                pass
+        try:
+            xs_s, ys_s = _load_sensors(meas)
+            if xs_s is not None and idx < len(xs_s):
+                x_pos = round(float(xs_s[idx]), 6)
+                y_pos = round(float(ys_s[idx]), 6)
+        except Exception:
+            pass
 
         return _safe_json({"index": idx, "z": z, "d": d, "zs": zs,
                            "n": len(d), "n_curves": n_curves,
                            "x_pos": x_pos, "y_pos": y_pos})
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/fv-maps")
+def fv_maps_stream(folder: str):
+    """SSE stream that processes all FV LVM files and returns topography + E maps.
+
+    Events:
+      {type:'progress', done:N, total:N, label:str}
+      {type:'done', topo:[[...]], E:[[...]], grid:[rows,cols],
+                    x_raw:[...], y_raw:[...],
+                    x_coords:[...], y_coords:[...], grid_n:N}
+      {type:'error', message:str}
+    """
+    meas = Path(folder)
+    if not meas.exists():
+        def _e():
+            yield 'data: ' + _json.dumps({"type":"error","message":f"Not found: {folder}"}) + '\n\n'
+        return StreamingResponse(_e(), media_type="text/event-stream")
+
+    def ev(obj):
+        return 'data: ' + _json.dumps(_sanitize(obj), ensure_ascii=False, default=str) + '\n\n'
+
+    def generate():
+        import numpy as _np
+        import math as _math
+        from pathlib import Path as _P
+
+        # ── Read config ───────────────────────────────────────────────────────
+        cfg_path = meas / "config.txt"
+        nx, ny = 10, 10
+        xlength, ylength = 0.0, 0.0
+        if cfg_path.exists():
+            import re as _re
+            txt = cfg_path.read_text(encoding="utf-8", errors="replace")
+            def _ci(key, default):
+                m = _re.search(key + r',([0-9.]+)', txt)
+                return int(float(m.group(1))) if m else default
+            def _cf(key, default):
+                m = _re.search(key + r',([0-9.]+)', txt)
+                return float(m.group(1)) if m else default
+            nx = _ci("Xstep", 10); ny = _ci("Ystep", 10)
+            xlength = _cf("xlength", 0.0); ylength = _cf("ylength", 0.0)
+
+        # ── Find LVM files ────────────────────────────────────────────────────
+        lvm_dir = meas / "ForceCurve"
+        if not lvm_dir.exists():
+            lvm_dir = meas   # fallback: LVMs directly in meas folder
+        import re as _re
+        lvm_files = sorted(lvm_dir.glob("ForceCurve_*.lvm"),
+                           key=lambda p: int(_re.search(r'(\d+)', p.stem).group(1))
+                           if _re.search(r'(\d+)', p.stem) else 0)
+        if not lvm_files:
+            yield ev({"type":"error","message":"No ForceCurve_*.lvm files found"})
+            return
+
+        n_files = len(lvm_files)
+        yield ev({"type":"progress","done":0,"total":n_files,
+                  "label":f"Found {n_files} LVM files ({nx}×{ny} grid)…"})
+
+        # ── Cantilever params from comments sidecar ───────────────────────────
+        INVOLS = 0.1686; StIV = 30.0; k = 0.09; nu = 0.5; alpha = 17.5
+        try:
+            from afm_io import load_comments as _lc
+            comments = _lc(meas)
+            cant = comments.get("cantilever","AC40")
+            from io_utils_PF import get_cantilever_defaults as _gcd
+            cd = _gcd(cant)
+            INVOLS = cd["invols"] / 1000.0   # nm→um
+            k      = cd["k"]
+        except Exception:
+            pass
+
+        # ── Multiprocessing ───────────────────────────────────────────────────
+        n_cores = max(1, round((os.cpu_count() or 1) * 0.8))
+        args_list = [(str(p), i, INVOLS, StIV, k, 8, 3, 10, nu, alpha)
+                     for i, p in enumerate(lvm_files)]
+
+        results = [None] * n_files
+        done = 0
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=n_cores) as pool:
+            for res in pool.imap_unordered(_fv_worker, args_list, chunksize=4):
+                idx, zm, ds, cp, E_val = res
+                results[idx] = (zm, ds, cp, E_val)
+                done += 1
+                yield ev({"type":"progress","done":done,"total":n_files,
+                          "label":f"{lvm_files[idx].name}"})
+
+        # ── Build maps ────────────────────────────────────────────────────────
+        topo = _np.array([r[0][r[2]] if r and len(r[0]) > r[2] else _np.nan
+                          for r in results], dtype=_np.float32)
+        E_arr = _np.array([r[3] if r else _np.nan for r in results], dtype=_np.float32)
+
+        # Subtract median topo baseline
+        valid_t = topo[_np.isfinite(topo)]
+        if len(valid_t): topo -= _np.median(valid_t)
+
+        # Grid layout: reshape to (ny, nx)
+        rows, cols = ny, nx
+        topo_grid = topo[:rows*cols].reshape(rows, cols)
+        E_grid    = E_arr[:rows*cols].reshape(rows, cols)
+
+        def _mg(grid):
+            flat = grid.ravel().tolist()
+            vld = [v for v in flat if v is not None and _math.isfinite(v)]
+            return {"data":[round(float(v),4) if _math.isfinite(float(v)) else None
+                            for v in flat],
+                    "rows":rows,"cols":cols,
+                    "vmin":round(min(vld),4) if vld else 0,
+                    "vmax":round(max(vld),4) if vld else 1}
+
+        # X/Y positions for crosshair
+        xs = _np.array([(i % cols) * (xlength / max(cols-1,1)) for i in range(rows*cols)],
+                        dtype=_np.float32)
+        ys = _np.array([(i // cols) * (ylength / max(rows-1,1)) for i in range(rows*cols)],
+                        dtype=_np.float32)
+        xi = _np.linspace(0, xlength, cols) if xlength > 0 else _np.arange(cols, dtype=_np.float32)
+        yi = _np.linspace(0, ylength, rows) if ylength > 0 else _np.arange(rows, dtype=_np.float32)
+
+        yield ev({"type":"done",
+                  "topo": _mg(topo_grid),
+                  "E":    _mg(E_grid),
+                  "grid": [rows, cols],
+                  "x_raw":    [round(float(v),3) for v in xs],
+                  "y_raw":    [round(float(v),3) for v in ys],
+                  "x_coords": [round(float(v),3) for v in xi],
+                  "y_coords": [round(float(v),3) for v in yi],
+                  "grid_n":   cols})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+
+@app.get("/api/fv-fc")
+def get_fv_fc(folder: str, index: int = 0):
+    """Return one FV force curve by LVM file index (pre-processed)."""
+    import math as _math
+    meas = Path(folder)
+    lvm_dir = meas / "ForceCurve"
+    if not lvm_dir.exists(): lvm_dir = meas
+    import re as _re
+    lvm_files = sorted(lvm_dir.glob("ForceCurve_*.lvm"),
+                       key=lambda p: int(_re.search(r'(\d+)', p.stem).group(1))
+                       if _re.search(r'(\d+)', p.stem) else 0)
+    if not lvm_files:
+        raise HTTPException(status_code=404, detail="No LVM files found")
+
+    idx = max(0, min(index, len(lvm_files)-1))
+    INVOLS = 0.1686; StIV = 30.0; k = 0.09; nu = 0.5; alpha = 17.5
+
+    res = _fv_worker((str(lvm_files[idx]), idx, INVOLS, StIV, k, 8, 3, 10, nu, alpha))
+    _, zm, ds, cp, E_val = res
+    nx = len(lvm_files)
+
+    def _c(arr):
+        return [None if _math.isnan(float(v)) or _math.isinf(float(v))
+                else round(float(v),5) for v in arr]
+
+    return _safe_json({
+        "index": idx, "n_curves": len(lvm_files),
+        "z": _c(zm), "d": _c(ds), "cp": int(cp),
+        "E": None if _math.isnan(E_val) else round(E_val, 2)
+    })
+
+
+@app.post("/api/fv-export")
+async def fv_export(request: "Request"):
+    """Generate paper-ready Topo + E figure as PDF with transparent background."""
+    import math as _math, io
+    import numpy as _np
+
+    body = await request.json()
+    topo_data   = body.get("topo")
+    e_data      = body.get("e")
+    rows        = int(body.get("rows", 10))
+    cols        = int(body.get("cols", 10))
+    x_um        = float(body.get("x_um", 0))
+    y_um        = float(body.get("y_um", 0))
+    clip_pct    = float(body.get("clip_pct", 5))
+    interp      = bool(body.get("interpolate", False))
+    sample_name = str(body.get("sample_name", ""))
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
+
+        # ── helpers ──────────────────────────────────────────────────────────
+        def _arr(data, r, c):
+            return _np.array([v if (v is not None and _math.isfinite(v)) else _np.nan
+                               for v in data], dtype=_np.float64).reshape(r, c)
+
+        def _clip(a, pct):
+            vals = a[_np.isfinite(a)]
+            if not len(vals): return a, float(_np.nanmin(a)), float(_np.nanmax(a))
+            return a, float(_np.percentile(vals, pct)), float(_np.percentile(vals, 100-pct))
+
+        def _upsample_spline(a, out_rows, out_cols):
+            """Sharp upsampling via 2-D cubic spline — avoids zoom artefacts."""
+            from scipy.interpolate import RectBivariateSpline as _RBS
+            a_f = _np.nan_to_num(a, nan=float(_np.nanmedian(a)))
+            yr = _np.linspace(0, 1, a.shape[0])
+            xr = _np.linspace(0, 1, a.shape[1])
+            spl = _RBS(yr, xr, a_f, kx=3, ky=3)
+            yo  = _np.linspace(0, 1, out_rows)
+            xo  = _np.linspace(0, 1, out_cols)
+            return spl(yo, xo).astype(_np.float32)
+
+        def _nice_ticks(lo, hi, n=5):
+            span = hi - lo
+            if span <= 0: return [round(lo,6), round(hi,6)]
+            raw  = span / (n - 1)
+            mag  = 10 ** _np.floor(_np.log10(max(abs(raw), 1e-30)))
+            step = round(raw / mag) * mag
+            if step == 0: return [round(lo,6), round(hi,6)]
+            start = _np.ceil(lo / step) * step
+            t, v  = [], float(start)
+            while v <= hi + 1e-9:
+                t.append(round(v, 8)); v += step
+            return t if len(t) >= 2 else [round(lo,6), round(hi,6)]
+
+        T, E = _arr(topo_data, rows, cols), _arr(e_data, rows, cols)
+        _, tlo, thi = _clip(T, clip_pct)
+        _, elo, ehi = _clip(E, clip_pct)
+
+        OUT = 512
+        if interp:
+            # Correct aspect: expand each axis proportionally
+            if rows >= cols:
+                out_r, out_c = OUT, max(1, round(OUT * cols / rows))
+            else:
+                out_r, out_c = max(1, round(OUT * rows / cols)), OUT
+            T_p = _upsample_spline(T, out_r, out_c)
+            E_p = _upsample_spline(E, out_r, out_c)
+        else:
+            T_p, E_p = T, E
+
+        # Figure physical size: each map is 3 cm wide × correct aspect
+        phys_aspect = (y_um / x_um) if x_um > 0 and y_um > 0 else (rows / max(cols, 1))
+        map_w_in = 1.7   # inches per map
+        map_h_in = map_w_in * phys_aspect
+        map_h_in = max(0.8, min(4.0, map_h_in))   # clamp
+        fig_w    = map_w_in * 2 + 1.6              # two maps + colorbars + gap
+        fig_h    = map_h_in + 0.7                  # maps + title space
+
+        fig, axes = plt.subplots(1, 2, figsize=(fig_w, fig_h))
+        fig.patch.set_alpha(0)   # transparent background
+
+        specs = [
+            (axes[0], T_p, tlo, thi, "viridis",  "Topography",     "μm",   True),
+            (axes[1], E_p, elo, ehi, "inferno",  "Elasticity (E)", "kPa",  False),
+        ]
+        for ax, data, vlo, vhi, cmap, title_str, unit, add_sb in specs:
+            im = ax.imshow(data, cmap=cmap, vmin=vlo, vmax=vhi,
+                           origin="upper",
+                           interpolation="none",   # data is already upsampled
+                           aspect="equal" if interp else "auto")
+
+            # Black outline
+            for sp in ax.spines.values():
+                sp.set_visible(True); sp.set_edgecolor("black"); sp.set_linewidth(0.7)
+            ax.set_xticks([]); ax.set_yticks([])
+
+            # Title above plot, left-aligned
+            ax.set_title(title_str, fontsize=8, loc="left", pad=3, fontweight="bold")
+
+            # Colorbar
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03, aspect=18)
+            cb.set_label(unit, fontsize=7, labelpad=2)
+            ticks = _nice_ticks(vlo, vhi, n=5)
+            cb.set_ticks([t for t in ticks if vlo <= t <= vhi] or [vlo, vhi])
+            cb.ax.tick_params(labelsize=6.5)
+            cb.outline.set_linewidth(0.5)
+
+            # Scale bar (25% width, bottom-left)
+            if add_sb and x_um > 0:
+                h_px, w_px = data.shape
+                sb_frac = 0.25
+                sb_um   = x_um * sb_frac
+                bar_len = w_px * sb_frac
+                x0 = w_px * 0.05; y0 = h_px * 0.93
+                ax.plot([x0, x0+bar_len],[y0, y0], color="white",
+                        linewidth=2.0, solid_capstyle="butt", zorder=5)
+                lbl = f"{sb_um:.0f} μm" if sb_um >= 1 else f"{sb_um*1000:.0f} nm"
+                ax.text(x0+bar_len/2, y0-h_px*0.04, lbl,
+                        color="white", fontsize=6, ha="center", va="bottom", zorder=5)
+
+        plt.tight_layout(pad=0.5, w_pad=0.6)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="pdf", bbox_inches="tight",
+                    transparent=True, backend="pdf")
+        plt.close(fig)
+        buf.seek(0)
+        fname = (sample_name.replace(" ","_") or "fv_maps") + ".pdf"
+        return Response(content=buf.read(), media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+    except Exception as e:
+        import traceback
+        return _safe_json({"error": str(e), "traceback": traceback.format_exc()})
 
 
 @app.get("/api/health")
