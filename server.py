@@ -147,16 +147,32 @@ from afm_io import (discover_all, update_dataset_meta,
                      _dataset_is_filled, _create_nan_config)
 
 
+
+# Bump this whenever map computation logic changes — forces all npz to regenerate
+_MAP_CACHE_VERSION = 3
+
 _sensor_cache: dict = {}   # folder -> (xs, ys)
-_tdms_cache:   dict = {}   # folder -> (D, Z, Zs, n_samp, mtime)
-_maps_cache:   dict = {}   # folder -> (result_dict, mtime)  — skip recompute on re-expand
+_maps_cache:   dict = {}   # folder -> (result_dict, mtime)
+
+# LRU TDMS cache — max 3 folders in RAM at once.
+# Each large PF file is 30-90 MB; unlimited caching caused 16 GB+ RAM use.
+_MAX_TDMS = 3
+_tdms_cache: dict = {}
+_tdms_lru:   list = []   # oldest-first access order
+
+
+def _tdms_put(key, val):
+    """Insert into LRU cache, evict oldest if over limit."""
+    if key in _tdms_cache:
+        _tdms_lru.remove(key)
+    _tdms_lru.append(key)
+    _tdms_cache[key] = val
+    while len(_tdms_lru) > _MAX_TDMS:
+        del _tdms_cache[_tdms_lru.pop(0)]   # numpy arrays released → GC frees RAM
 
 
 def _load_tdms_arrays(meas: Path):
-    """Return (D, Z, n_samp) numpy arrays, cached in memory.
-    Cache is invalidated automatically when the TDMS file is modified.
-    Returns (None, None, None) if the file is missing or unreadable.
-    """
+    """Return (D, Z, Zs, n_samp) float32 arrays, LRU-cached (last 3 folders)."""
     import numpy as _np
     tdms_path = meas / "ForceCurve.tdms"
     if not tdms_path.exists():
@@ -164,31 +180,30 @@ def _load_tdms_arrays(meas: Path):
     key   = str(meas)
     mtime = tdms_path.stat().st_mtime
     if key in _tdms_cache and _tdms_cache[key][4] == mtime:
+        _tdms_lru.remove(key); _tdms_lru.append(key)   # refresh LRU
         D, Z, Zs, n_samp, _ = _tdms_cache[key]
         return D, Z, Zs, n_samp
     try:
         from nptdms import TdmsFile as _TF
-        import re as _re
-        import tempfile as _tmp, shutil as _sh
+        import re as _re, tempfile as _tmp, shutil as _sh
         _mmap = _tmp.mkdtemp(prefix="afm_mm_")
         try:
             tdms = _TF.read(str(tdms_path), memmap_dir=_mmap)
         except Exception:
             tdms = _TF.read(str(tdms_path))
-        chs  = tdms["Forcecurve"].channels()
-        D    = _np.array(chs[0][:], dtype=_np.float32)  # Deflection
-        Z    = _np.array(chs[1][:], dtype=_np.float32)  # ZTip_input
-        Zs   = _np.array(chs[2][:], dtype=_np.float32) if len(chs)>2 else _np.array([], dtype=_np.float32)
+        chs = tdms["Forcecurve"].channels()
+        D   = _np.array(chs[0][:], dtype=_np.float32)   # Deflection
+        Z   = _np.array(chs[1][:], dtype=_np.float32)   # ZTip_input
+        Zs  = _np.array(chs[2][:], dtype=_np.float32) if len(chs)>2 else _np.array([], dtype=_np.float32)
         try: _sh.rmtree(_mmap, ignore_errors=True)
         except Exception: pass
-        # n_samp from config
         n_samp = 500
         cfg = meas / "config.txt"
         if cfg.exists():
             m = _re.search(r"FCあたりのデータ取得点数:\s*([0-9]+)",
                            cfg.read_text(encoding="utf-8", errors="replace"))
             if m: n_samp = int(m.group(1))
-        _tdms_cache[key] = (D, Z, Zs, n_samp, mtime)
+        _tdms_put(key, (D, Z, Zs, n_samp, mtime))
         return D, Z, Zs, n_samp
     except Exception:
         return None, None, None, None
@@ -221,6 +236,20 @@ def _compute_and_cache_maps(meas) -> bool:
     half  = n_samp // 2
     D_app = D_all[:n_pts*n_samp].reshape(n_pts, n_samp)[:, :half]
     Z_app = Z_all[:n_pts*n_samp].reshape(n_pts, n_samp)[:, :half]
+
+    # Return-direction mask (dx < 0)
+    dx    = _np.diff(xs, prepend=xs[0])
+    rmask = dx < 0
+    if rmask.sum() < 4: rmask = _np.ones(n_pts, dtype=bool)
+    pts_r = (xs[rmask], ys[rmask])
+
+    # Use only return-direction points (dx < 0) for cleaner maps
+    dx   = _np.diff(xs, prepend=xs[0])
+    rmask = dx < 0
+    pts_r = (xs[rmask], ys[rmask])  # subset positions
+    if rmask.sum() < 4:             # too few — fall back to all points
+        rmask = _np.ones(n_pts, dtype=bool)
+        pts_r = pts
     n_base = max(5, half//5)
     bm = D_app[:, :n_base].mean(axis=1, keepdims=True)
     bs = D_app[:, :n_base].std(axis=1,  keepdims=True).clip(min=1e-6)
@@ -230,7 +259,7 @@ def _compute_and_cache_maps(meas) -> bool:
     cp    = Z_app[_np.arange(n_pts), fi].copy()
     cp[~any_a]    = Z_app[~any_a].max(axis=1)
     cp[above[:,0]]= Z_app[above[:,0], 0]
-    cp_grid = _gd(pts, cp, (Xi, Yi), method="nearest").astype(_np.float32)
+    cp_grid = _gd(pts_r, cp[rmask], (Xi, Yi), method="nearest").astype(_np.float32)
     arrays  = {"cp": cp_grid,
                "xi": xi.astype(_np.float32), "yi": yi.astype(_np.float32),
                "x_raw": xs.astype(_np.float32), "y_raw": ys.astype(_np.float32),
@@ -241,9 +270,10 @@ def _compute_and_cache_maps(meas) -> bool:
             try:
                 v = _fast_load_txt(p).astype(_np.float32)
                 if len(v)==n_pts:
-                    arrays[key] = _gd(pts, v, (Xi,Yi), method="nearest").astype(_np.float32)
+                    arrays[key] = _gd(pts_r, v[rmask], (Xi,Yi), method="nearest").astype(_np.float32)
             except Exception: pass
     try:
+        arrays["_version"] = _np.array([_MAP_CACHE_VERSION], dtype=_np.int32)
         _np.savez_compressed(str(npz), **arrays)
         return True
     except Exception:
@@ -251,17 +281,54 @@ def _compute_and_cache_maps(meas) -> bool:
 
 
 def _load_sensors(meas):
-    """Load Xsensors.txt / Ysensors.txt with in-memory caching."""
-    import numpy as _np
+    """Load Xsensors.txt; always synthesise Y from config.txt.
+
+    Y is synthesised regardless of Ysensors.txt — the Y stage sensor is
+    unreliable.  Synthesis:
+      nx = XStep (columns), ny = YStep (rows)
+      y[i] = row_index × y_range / (ny-1)
+      y_range = x_sensor_range × (Y_size_um / X_size_um)
+    """
+    import numpy as _np, re as _re
     key = str(meas)
     if key in _sensor_cache:
         return _sensor_cache[key]
     xf = meas / "Xsensors.txt"
-    yf = meas / "Ysensors.txt"
-    if not xf.exists() or not yf.exists():
+    if not xf.exists():
         return None, None
     xs = _fast_load_txt(xf)
-    ys = _fast_load_txt(yf)
+    n  = len(xs)
+
+    # Always synthesise Y from config
+    nx, ny = 1, 1
+    x_size_um, y_size_um = 0.0, 0.0
+    cfg = meas / "config.txt"
+    if cfg.exists():
+        try:
+            txt = cfg.read_text(encoding="utf-8", errors="replace")
+            mx  = _re.search(r"XStep:\s*([0-9]+)", txt)
+            my  = _re.search(r"YStep:\s*([0-9]+)", txt)
+            mxs = _re.search(r"X.{1,10}?\(.*?m\):\s*([0-9.]+)", txt)
+            mys = _re.search(r"Y.{1,10}?\(.*?m\):\s*([0-9.]+)", txt)
+            if mx:  nx = max(1, int(mx.group(1)))
+            if my:  ny = max(1, int(my.group(1)))
+            if mxs: x_size_um = float(mxs.group(1))
+            if mys: y_size_um = float(mys.group(1))
+        except Exception:
+            pass
+
+    # Fallback: guess square grid
+    if nx * ny != n:
+        nx = max(1, round(_np.sqrt(n)))
+        ny = max(1, n // nx)
+
+    x_range = float(xs.max() - xs.min()) if xs.max() != xs.min() else 1.0
+    y_range  = x_range * (y_size_um / x_size_um) if x_size_um > 0 and y_size_um > 0 else x_range
+
+    row_idx = _np.arange(n) // nx
+    ys = xs.min() + row_idx.astype(_np.float64) * y_range / max(ny - 1, 1)
+    ys = ys.astype(_np.float32)
+
     _sensor_cache[key] = (xs, ys)
     return xs, ys
 
@@ -296,8 +363,21 @@ BASE_DIR = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
-# Default scan root — empty until user sets it
-_current_root: str = ""
+# ── Persist root path across restarts ────────────────────────────────────────
+_CONFIG_FILE = Path(__file__).parent / ".afm_root"
+
+def _load_saved_root() -> str:
+    try:
+        p = Path(_CONFIG_FILE.read_text(encoding="utf-8").strip())
+        return str(p) if p.exists() else ""
+    except Exception:
+        return ""
+
+def _save_root(root: str):
+    try: _CONFIG_FILE.write_text(root, encoding="utf-8")
+    except Exception: pass
+
+_current_root: str = _load_saved_root()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,8 +403,15 @@ def set_root(payload: RootPayload):
     global _current_root
     p = Path(payload.root)
     if not p.exists():
-        raise HTTPException(status_code=400, detail=f"Path does not exist: {payload.root}")
+        # Give a helpful message — drive may not be mounted
+        msg = f"Path not found: {payload.root}"
+        if "/Volumes/" in payload.root or payload.root.startswith("/mnt/"):
+            msg += " — is the drive mounted?"
+        elif len(payload.root) >= 2 and payload.root[1] == ":":
+            msg += " — is the drive connected?"
+        raise HTTPException(status_code=400, detail=msg)
     _current_root = str(p)
+    _save_root(_current_root)
     return _safe_json({"root": _current_root})
 
 
@@ -607,8 +694,7 @@ def update_dataset(payload: UpdatePayload):
 def get_maps(folder: str):
     """Build spatial maps from sensor files and TDMS force curves.
 
-    All data points are irregularly spaced — positions come from Xsensors.txt /
-    Ysensors.txt.  Everything is interpolated onto a regular grid of at most
+    X positions from Xsensors.txt; Y is always synthesised from config (Y sensor unreliable).  Everything is interpolated onto a regular grid of at most
     100x100 using nearest-neighbour griddata.
 
     Maps returned:
@@ -629,7 +715,7 @@ def get_maps(folder: str):
 
     # Return cached map result if TDMS/sensor files unchanged
     _map_mtime = 0
-    for _fn in ["ForceCurve.tdms","Xsensors.txt","Ysensors.txt","ZSamplePID.txt","ZTipoffsets.txt"]:
+    for _fn in ["ForceCurve.tdms","Xsensors.txt","ZSamplePID.txt","ZTipoffsets.txt"]:
         _fp = meas / _fn
         if _fp.exists(): _map_mtime = max(_map_mtime, _fp.stat().st_mtime)
     _map_key = str(meas)
@@ -645,10 +731,11 @@ def get_maps(folder: str):
     # ── Fast path: pre-computed .npz ─────────────────────────────────────────
     _npz = meas / "afm_maps.npz"
     _tdms2 = meas / "ForceCurve.tdms"
-    if (_npz.exists() and
-            (not _tdms2.exists() or _npz.stat().st_mtime >= _tdms2.stat().st_mtime)):
+    if _npz.exists() and (not _tdms2.exists() or _npz.stat().st_mtime >= _tdms2.stat().st_mtime):
         try:
             npz = _np2.load(str(_npz))
+            if int(npz.get("_version", _np2.array([0]))[0]) != _MAP_CACHE_VERSION:
+                raise ValueError("stale cache version")
             GRID2 = int(npz["grid_n"][0])
             def _nm(arr):
                 flat=[round(float(v),4) for v in arr.ravel()]
@@ -691,10 +778,12 @@ def get_maps(folder: str):
     Xi, Yi = _np.meshgrid(xi, yi)
     pts = (xs, ys)
 
-    def gridmap(values):
+    def gridmap(values, gpts=None, mask=None):
         """Grid irregular values onto GRID×GRID, return sanitised flat list."""
         from scipy.interpolate import griddata as _gd
-        g = _gd(pts, values, (Xi, Yi), method="nearest")
+        _pts = gpts if gpts is not None else pts
+        _vals = values[mask] if mask is not None else values
+        g = _gd(_pts, _vals, (Xi, Yi), method="nearest")
         flat = g.ravel()
         clean = [None if (_math.isnan(v) or _math.isinf(v)) else round(float(v), 5)
                  for v in flat]
@@ -704,6 +793,12 @@ def get_maps(folder: str):
         return {"data": clean, "rows": GRID, "cols": GRID,
                 "n": len(clean), "vmin": vmin, "vmax": vmax}
 
+    # ── Return-direction mask (dx < 0 on X sensor) ───────────────────────────
+    _dx    = _np.diff(xs, prepend=xs[0])
+    rmask  = _dx < 0
+    if rmask.sum() < 4: rmask = _np.ones(n_pts, dtype=bool)
+    pts_r  = (xs[rmask], ys[rmask])
+
     # ── Sensor text files ─────────────────────────────────────────────────────
     for fname in ["ZSamplePID.txt", "ZTipoffsets.txt"]:
         p = meas / fname
@@ -712,7 +807,7 @@ def get_maps(folder: str):
         try:
             vals = _fast_load_txt(p)
             if len(vals) == n_pts:
-                result["maps"][fname] = gridmap(vals)
+                result["maps"][fname] = gridmap(vals, pts_r, rmask)
         except Exception:
             pass
 
@@ -748,7 +843,7 @@ def get_maps(folder: str):
                 cp_z[~any_above]   = Z_app[~any_above].max(axis=1)   # no contact
                 cp_z[above[:, 0]]  = Z_app[above[:, 0], 0]           # full contact
 
-                result["maps"]["CP"] = gridmap(cp_z)
+                result["maps"]["CP"] = gridmap(cp_z, pts_r, rmask)
         except Exception:
             pass   # CP map skipped on error
 

@@ -143,6 +143,10 @@ tr.xrow td{padding:0!important;border-bottom:none!important}
 .xmap-title{font-family:var(--mono);font-size:.62rem;color:var(--dim);text-transform:uppercase;letter-spacing:.07em}
 .xmap canvas{border-radius:3px;border:1px solid var(--bdh)}
 .xmap-vals{font-family:var(--mono);font-size:.6rem;color:var(--dim);display:flex;justify-content:space-between;width:100%}
+.xmap-wrap{display:flex;flex-direction:row;gap:3px;align-items:stretch}
+.xmap-cb{display:flex;flex-direction:column;justify-content:space-between;align-items:flex-end}
+.xmap-cb canvas{border-radius:2px;display:block}
+.xmap-cb span{font-family:var(--mono);font-size:.55rem;color:var(--dim);white-space:nowrap;line-height:1.2}
 .xmap-empty{font-family:var(--mono);font-size:.65rem;color:var(--dim);font-style:italic;padding:20px 0}
 .xtoggle{cursor:pointer;font-size:.68rem;color:var(--dim);padding:2px 6px;border-radius:3px;
   user-select:none;transition:color .15s}
@@ -341,6 +345,35 @@ function drawMap(canvas, m, crossGridIdx){
   }
 }
 
+// ── slim vertical colorbar (viridis, top=max bottom=min) ───────────────────────
+function drawColorbar(canvas){
+  var W=canvas.width, H=canvas.height;
+  var ctx=canvas.getContext('2d');
+  var img=ctx.createImageData(W,H);
+  for(var y=0;y<H;y++){
+    var ti=Math.round((1-y/H)*255);
+    for(var x=0;x<W;x++){
+      var i=(y*W+x)*4;
+      img.data[i]  =_VLUT[ti*3];
+      img.data[i+1]=_VLUT[ti*3+1];
+      img.data[i+2]=_VLUT[ti*3+2];
+      img.data[i+3]=255;
+    }
+  }
+  ctx.putImageData(img,0,0);
+}
+
+function fmtCb(v){
+  if(v==null||!isFinite(v)) return '\u2014';
+  var a=Math.abs(v);
+  if(a===0) return '0';
+  if(a>=100) return v.toFixed(0);
+  if(a>=10)  return v.toFixed(1);
+  if(a>=1)   return v.toFixed(2);
+  if(a>=0.1) return v.toFixed(3);
+  return v.toExponential(1);
+}
+
 // ── draw force curve D vs Z, optional contact point index ────────────────────
 function drawFC(canvas, z, d, cp_idx){
   var W=canvas.width, H=canvas.height;
@@ -530,21 +563,24 @@ function loadFVMaps(panel, d){
         ttl.textContent=name; xmap.appendChild(ttl);
 
         var mc=initMapCanvas(m.cols,m.rows,cW,cH);
-        mc.data._overlay=mc.overlay;  // link overlay to data canvas
+        mc.data._overlay=mc.overlay;
         drawMap(mc.data,m,null);
-        xmap.appendChild(mc.wrap);
+        var cbWrap=document.createElement('div'); cbWrap.className='xmap-cb';
+        var cbMax=document.createElement('span'); cbMax.textContent=fmtCb(m.vmax);
+        var cbCv=document.createElement('canvas'); cbCv.width=8; cbCv.height=cH;
+        cbCv.style.cssText='width:8px;height:'+cH+'px';
+        drawColorbar(cbCv);
+        var cbMin=document.createElement('span'); cbMin.textContent=fmtCb(m.vmin);
+        cbWrap.appendChild(cbMax); cbWrap.appendChild(cbCv); cbWrap.appendChild(cbMin);
+        var mwrap=document.createElement('div'); mwrap.className='xmap-wrap';
+        mwrap.appendChild(mc.wrap); mwrap.appendChild(cbWrap);
+        xmap.appendChild(mwrap);
         _mapCanvases.push({cv:mc.data,m:m,name:name});
-
-        // click on overlay (top layer)
         mc.overlay.addEventListener('click',function(ev){
           var rect=mc.overlay.getBoundingClientRect();
           var fi=pixelToFCIdx(mc.data,ev.clientX-rect.left,ev.clientY-rect.top);
           if(fi>=0&&_slider){_slider.value=fi;if(_loadFVFC)_loadFVFC(fi);}
         });
-        var vals=document.createElement('div'); vals.className='xmap-vals';
-        vals.style.width=cW+'px';
-        vals.innerHTML='<span>'+m.vmin.toFixed(3)+'</span><span>'+m.vmax.toFixed(3)+'</span>';
-        xmap.appendChild(vals);
         panel.insertBefore(xmap,pb);
       });
 
@@ -821,26 +857,31 @@ function loadMaps(panel, d){
           var mc=initMapCanvas(GRID,GRID,cW,cH);
           mc.data._overlay=mc.overlay;
           drawMap(mc.data,m,null);
-          wrap.appendChild(mc.wrap);
+          var cbWrap=document.createElement('div'); cbWrap.className='xmap-cb';
+          var cbMax=document.createElement('span'); cbMax.textContent=fmtCb(m.vmax);
+          var cbCv=document.createElement('canvas'); cbCv.width=8; cbCv.height=cH;
+          cbCv.style.cssText='width:8px;height:'+cH+'px';
+          drawColorbar(cbCv);
+          var cbMin=document.createElement('span'); cbMin.textContent=fmtCb(m.vmin);
+          cbWrap.appendChild(cbMax); cbWrap.appendChild(cbCv); cbWrap.appendChild(cbMin);
+          var mwrap=document.createElement('div'); mwrap.className='xmap-wrap';
+          mwrap.appendChild(mc.wrap); mwrap.appendChild(cbWrap);
+          wrap.appendChild(mwrap);
           mapCanvases.push({cv:mc.data,m:m});
           mc.overlay.addEventListener('click',function(e){
             var rect=mc.overlay.getBoundingClientRect();
             var fi=pixelToFCIdx(mc.data,e.clientX-rect.left,e.clientY-rect.top);
             if(fi>=0){slider.value=fi;loadFC(fi);}
           });
-          var vals=document.createElement('div'); vals.className='xmap-vals';
-          vals.style.width=cW+'px';
-          vals.innerHTML='<span>'+m.vmin.toFixed(3)+'</span><span>'+m.vmax.toFixed(3)+'</span>';
-          wrap.appendChild(vals);
-          panel.insertBefore(wrap, pb);   // insert BEFORE progress bar
+          panel.insertBefore(wrap, pb);
         });
         step(70,'Drawing maps done — fetching FC…',
           names.length+' map(s) rendered in '+(performance.now()-tDraw).toFixed(0)+'ms');
       } else {
         var em=document.createElement('div'); em.className='xmap-empty';
-        em.textContent='No sensor files (Xsensors.txt / Ysensors.txt needed)';
+        em.textContent='No sensor file (Xsensors.txt needed)';
         panel.insertBefore(em, pb);
-        step(70,'No maps — fetching FC…','no Xsensors/Ysensors files');
+        step(70,'No maps — fetching FC…','Xsensors.txt not found');
       }
 
       // ── divider ───────────────────────────────────────────────────────────
