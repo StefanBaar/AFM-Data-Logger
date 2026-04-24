@@ -108,6 +108,8 @@ td.cm{min-width:180px;max-width:340px;white-space:normal;word-break:break-word;v
 .bdg.fv{background:hsla(225,70%,38%,.35);color:var(--fv);border:1px solid var(--fv-bd)}
 .nc{display:inline-block;font-size:.59rem;color:var(--er);
   border:1px solid rgba(240,112,112,.35);padding:1px 5px;border-radius:3px;margin-left:5px;vertical-align:middle}
+.partial-badge{display:inline-block;font-size:.59rem;color:hsl(38,95%,60%);
+  border:1px solid hsla(38,95%,60%,.45);padding:1px 5px;border-radius:3px;margin-left:5px;vertical-align:middle}
 
 /* editable */
 .ed{cursor:pointer;border-radius:3px;padding:2px 4px;margin:-2px -4px;display:inline-block;min-width:34px}
@@ -428,7 +430,7 @@ function drawFC(canvas, z, d, cp_idx){
 }
 
 // ── main expand loader ──────────────────────────────────────────────────────
-function loadFVMaps(panel, d){
+function loadFVMaps(panel, d, _partialBadgeWrap){
   var folder = d.folder;
   var t0 = performance.now();
   function ms(){ return ((performance.now()-t0)/1000).toFixed(2)+'s'; }
@@ -506,9 +508,13 @@ function loadFVMaps(panel, d){
     return row*_GRID+col;
   }
 
-  function pixelToFCIdx(cv,px,py){
-    var col=Math.min(_GRID-1,Math.max(0,Math.floor(px/cv.clientWidth*_GRID)));
-    var row=Math.min(_GRID-1,Math.max(0,Math.floor(py/cv.clientHeight*_GRID)));
+  function pixelToFCIdx(ov,px,py){
+    // ov is the overlay canvas — use its actual rendered size, not cW/cH
+    // (cW/cH are defined later in the done handler, so can't be used here)
+    var dispW=ov.clientWidth||ov.width||1;
+    var dispH=ov.clientHeight||ov.height||1;
+    var col=Math.min(_GRID-1,Math.max(0,Math.floor(px/dispW*_GRID)));
+    var row=Math.min(_GRID-1,Math.max(0,Math.floor(py/dispH*_GRID)));
     var xC=_xCoords[col]||0, yC=_yCoords[row]||0, best=0, bestD=1e18;
     for(var i=0;i<_xRaw.length;i++){
       var dx=_xRaw[i]-xC, dy=_yRaw[i]-yC, dd=dx*dx+dy*dy;
@@ -531,6 +537,8 @@ function loadFVMaps(panel, d){
       es.close();
       step(90,'Processing complete — rendering…','LVM files processed at '+ms());
 
+      try {
+
       _xCoords=msg.x_coords||[]; _yCoords=msg.y_coords||[];
       _xRaw=msg.x_raw||[]; _yRaw=msg.y_raw||[];
       _GRID=msg.grid_n||10; _nCurves=_xRaw.length;
@@ -547,11 +555,21 @@ function loadFVMaps(panel, d){
       }
       _topoRaw=msg.topo; _eRaw=eRaw;
 
-      // Physical aspect ratio
-      var xSpan=_xCoords.length>1?Math.abs(_xCoords[_xCoords.length-1]-_xCoords[0]):1;
-      var ySpan=_yCoords.length>1?Math.abs(_yCoords[_yCoords.length-1]-_yCoords[0]):1;
-      var aspect=(xSpan&&ySpan)?xSpan/ySpan:1;
-      var cH=130, cW=Math.max(40,Math.min(220,Math.round(cH*aspect)));
+      // Show partial badge if scan was incomplete
+      if(msg.partial&&_partialBadgeWrap){
+        var _pb2=document.createElement('span');
+        _pb2.className='partial-badge'; _pb2.textContent='partial';
+        _partialBadgeWrap.appendChild(_pb2);
+      }
+
+      // 1:1 physical aspect ratio using x_um / y_um from server
+      var xUm=msg.x_um||0, yUm=msg.y_um||0;
+      var rows2=(_msgGrid&&_msgGrid[0])||10, cols2=(_msgGrid&&_msgGrid[1])||10;
+      var physAspect=(xUm>0&&yUm>0)?(xUm/yUm):(cols2/Math.max(rows2,1));
+      var cH=Math.min(200,Math.max(60,Math.round(130/Math.max(physAspect,0.25))));
+      var cW=Math.round(cH*physAspect);
+      cW=Math.max(40,Math.min(300,cW));
+      cH=Math.max(40,Math.min(300,cH));
 
       var tC=applyClip(_topoRaw,clipPct), eC=applyClip(_eRaw,clipPct);
 
@@ -741,6 +759,11 @@ function loadFVMaps(panel, d){
       _loadFVFC=loadFVFC_local;  // now clicks can call it
       _slider.addEventListener('input',function(){loadFVFC_local(parseInt(_slider.value));});
       loadFVFC_local(0);
+
+      } catch(renderErr) {
+        step(100,'Render error \u26a0','Error: '+renderErr.message);
+        console.error('FV render error:', renderErr);
+      }
     }
     else if(msg.type==='error'){
       es.close();
@@ -769,7 +792,23 @@ function loadMaps(panel, d){
   var pbLabel = document.createElement('span');
   pbLabel.style = 'font-family:var(--mono);font-size:.7rem;color:var(--dim);flex:1';
   pbLabel.textContent = 'Waiting for server…';
+  var recomputeBtn = document.createElement('button');
+  recomputeBtn.className = 'btn';
+  recomputeBtn.style = 'font-size:.62rem;padding:2px 8px;opacity:.7';
+  recomputeBtn.textContent = '\u21ba Recompute';
+  recomputeBtn.title = 'Delete cached .npz and recompute maps from scratch';
+  recomputeBtn.addEventListener('click', function(){
+    recomputeBtn.disabled = true; recomputeBtn.textContent = 'Working\u2026';
+    fetch('/api/clear-map-cache?folder='+encodeURIComponent(folder))
+      .then(function(r){ return r.json(); })
+      .then(function(){
+        panel.innerHTML = '';
+        loadMaps(panel, d);
+      })
+      .catch(function(){ recomputeBtn.textContent = 'Error'; recomputeBtn.disabled = false; });
+  });
   pbRow.appendChild(pbLabel);
+  pbRow.appendChild(recomputeBtn);
   pb.appendChild(pbRow);
 
   var pbTrack = document.createElement('div');
@@ -819,6 +858,7 @@ function loadMaps(panel, d){
       var yCoords = body.y_coords || [];
       var xRaw    = body.x_raw   || [];
       var yRaw    = body.y_raw   || [];
+      var gridToFC= body.grid_to_fc || [];  // O(1) cell->FC lookup
       var GRID    = body.grid_n  || 50;
       var nCurves = body.n_curves || 0;
 
@@ -834,12 +874,15 @@ function loadMaps(panel, d){
         for(var i=0;i<yCoords.length;i++){var dy=Math.abs(yCoords[i]-yp);if(dy<minDy){minDy=dy;row=i;}}
         return row*GRID+col;
       }
-      function pixelToFCIdx(cv,px,py){
-        var col=Math.min(GRID-1,Math.max(0,Math.floor(px/cv.clientWidth*GRID)));
-        var row=Math.min(GRID-1,Math.max(0,Math.floor(py/cv.clientHeight*GRID)));
-        var xC=xCoords[col], yC=yCoords[row], best=-1, bestD=1e18;
+      function pixelToFCIdx(ov,px,py){
+        // Use cW/cH from closure — more reliable than clientWidth in all browsers
+        var col=Math.min(GRID-1,Math.max(0,Math.floor(px/cW*GRID)));
+        var row=Math.min(GRID-1,Math.max(0,Math.floor(py/cH*GRID)));
+        var cell=row*GRID+col;
+        if(gridToFC.length>cell) return gridToFC[cell];  // O(1)
+        var xC=xCoords[col],yC=yCoords[row],best=-1,bestD=1e18;
         for(var i=0;i<xRaw.length;i++){
-          var dx=xRaw[i]-xC, dy=yRaw[i]-yC, dd=dx*dx+dy*dy;
+          var dx=xRaw[i]-xC,dy=yRaw[i]-yC,dd=dx*dx+dy*dy;
           if(dd<bestD){bestD=dd;best=i;}
         }
         return best;
@@ -870,7 +913,7 @@ function loadMaps(panel, d){
           mapCanvases.push({cv:mc.data,m:m});
           mc.overlay.addEventListener('click',function(e){
             var rect=mc.overlay.getBoundingClientRect();
-            var fi=pixelToFCIdx(mc.data,e.clientX-rect.left,e.clientY-rect.top);
+            var fi=pixelToFCIdx(mc.overlay,e.clientX-rect.left,e.clientY-rect.top);
             if(fi>=0){slider.value=fi;loadFC(fi);}
           });
           panel.insertBefore(wrap, pb);
@@ -1151,11 +1194,12 @@ function mkEd(d,field,val,ph){
   return s;
 }
 
-function mkBadge(mode,hasCfg){
+function mkBadge(mode,hasCfg,isPartial){
   var w=document.createElement('span');
   var b=document.createElement('span'); b.className='bdg '+mode.toLowerCase(); b.textContent=mode;
   w.appendChild(b);
   if(!hasCfg){var n=document.createElement('span');n.className='nc';n.textContent='no cfg';w.appendChild(n);}
+  if(isPartial){var p=document.createElement('span');p.className='partial-badge';p.textContent='partial';w.appendChild(p);}
   return w;
 }
 
@@ -1228,7 +1272,7 @@ function mkFV(d){
   var tr=document.createElement('tr');
   tr.dataset.folder=d.folder;
 
-  var badgeWrap=mkBadge('FV',d.has_config);
+  var badgeWrap=mkBadge('FV',d.has_config,d.partial||false);
   var tog=document.createElement('span');
   tog.className='xtoggle'; tog.textContent=' \u25b6';
   tog.title='Expand / show maps';
@@ -1259,7 +1303,7 @@ function mkFV(d){
     tog.classList.toggle('open',expanded);
     if(expanded){
       xpanel.classList.add('open');
-      if(!xpanel.dataset.loaded){xpanel.dataset.loaded='1';loadFVMaps(xpanel,d);}
+      if(!xpanel.dataset.loaded){xpanel.dataset.loaded='1';loadFVMaps(xpanel,d,badgeWrap);}
     } else {
       xpanel.classList.remove('open');
     }

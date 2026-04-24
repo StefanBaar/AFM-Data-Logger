@@ -50,95 +50,13 @@ def _safe_json(data) -> Response:
 
 # ── Multiprocessing worker (must be at module level to be picklable) ───────────
 
-def _fv_worker(args) -> tuple:
-    """Process one FV LVM file: load, pre_process, get_E.
-    args = (lvm_path_str, idx, INVOLS, StIV, k, ran, th, sample, nu, alpha)
-    Returns (idx, zm, ds, cp, E)
-    """
-    try:
-        import numpy as _np
-        from scipy import signal as _sig
-        from pathlib import Path as _P
-        lvm_path, idx, INVOLS, StIV, k, ran, th, sample, nu, alpha = args
 
-        # Fast LVM load
-        raw = open(lvm_path, 'rb').read().split()
-        n = len(raw) // 2
-        D = _np.array(raw[:n],   dtype=_np.float32)
-        Z = _np.array(raw[n:2*n], dtype=_np.float32)
-
-        # Downsample
-        d, z = D[::sample], Z[::sample]
-        z = z * StIV
-        base_n = max(1, len(d) // ran)
-
-        # Tilt correction + baseline
-        try:
-            slope = _np.polyfit(z[:base_n], d[:base_n], 1)[0]
-        except Exception:
-            slope = 0.0
-        d = d - slope * z
-        d = (d - _np.median(d[:base_n])) * INVOLS
-        sig = _np.std(d[:base_n]) * th
-
-        # Find contact point on approach
-        dmax = int(_np.argmax(d))
-        dm, zm = d[:dmax], z[:dmax]
-
-        if len(dm) >= 53:
-            ds = _np.array(_sig.savgol_filter(dm, 51, 11), dtype=_np.float32)
-        else:
-            ds = dm.copy()
-
-        below = _np.argwhere(ds < sig)
-        cp = int(below[-1][0]) if len(below) else max(0, len(zm) - 1)
-
-        # Young's modulus via Sneddon
-        E_val = _np.nan
-        if cp < len(zm) - 3:
-            import math as _math
-            Delta_m = (zm[cp:] - zm[cp]) * 1e-6   # um → m
-            F_N     = (ds[cp:] - ds[cp]) * k * 1e-6  # um * N/m → N... wait
-            # ds is in um (INVOLS converts V→um), k is N/m
-            # F [N] = deflection [m] * k [N/m] = ds[um] * 1e-6 * k
-            fmax = int(_np.argmax(F_N))
-            if fmax >= 3:
-                d2 = Delta_m[:fmax] ** 2
-                mask = d2 > 0
-                if mask.sum() >= 3:
-                    try:
-                        alpha_r = _math.radians(alpha)
-                        slope_s, _ = _np.polyfit(d2[mask], F_N[:fmax][mask], 1)
-                        E_val = float(slope_s * _math.pi * (1 - nu**2) /
-                                      (2 * _math.tan(alpha_r)))
-                        if E_val < 0: E_val = _np.nan
-                    except Exception:
-                        pass
-
-        zm_f = _np.array(zm, dtype=_np.float32)
-        ds_f = _np.array(ds, dtype=_np.float32)
-        return (idx, zm_f, ds_f, int(cp), float(E_val))
-    except Exception as e:
-        return (args[1], _np.array([]), _np.array([]), 0, float('nan'))
-
-
-def _stage_worker(folder_str: str) -> tuple:
-    """Run scan_tdms_stage in a subprocess. Returns (folder_str, result_dict)."""
-    try:
-        from pathlib import Path as _Path
-        sys.path.insert(0, str(_Path(__file__).parent))
-        from afm_io import scan_tdms_stage as _scan
-        result = _scan(_Path(folder_str))
-        try: _compute_and_cache_maps(_Path(folder_str))
-        except Exception: pass
-        return (folder_str, result)
-    except Exception as e:
-        return (folder_str, {})
 
 
 # ── Local import ─────────────────────────────────────────────────────────────
 
 sys.path.insert(0, str(Path(__file__).parent))
+import workers as _workers   # minimal-import worker module (Windows-safe spawn)
 from afm_io import (discover_all, update_dataset_meta,
                      _find_measurement_configs, _find_fv_configs,
                      parse_pf_path, parse_fv_path,
@@ -169,6 +87,19 @@ def _tdms_put(key, val):
     _tdms_cache[key] = val
     while len(_tdms_lru) > _MAX_TDMS:
         del _tdms_cache[_tdms_lru.pop(0)]   # numpy arrays released → GC frees RAM
+
+
+def _get_n_samp(meas: "Path") -> int:
+    """Read samples-per-FC from config.txt."""
+    import re as _re
+    cfg = Path(meas) / "config.txt"
+    if cfg.exists():
+        try:
+            txt = cfg.read_text(encoding="utf-8", errors="replace")
+            m = _re.search(u"FC\u3042\u305f\u308a\u306e\u30c7\u30fc\u30bf\u53d6\u5f97\u70b9\u6570:\\s*([0-9]+)", txt)
+            if m: return int(m.group(1))
+        except Exception: pass
+    return 500
 
 
 def _load_tdms_arrays(meas: Path):
@@ -210,70 +141,109 @@ def _load_tdms_arrays(meas: Path):
 
 
 def _compute_and_cache_maps(meas) -> bool:
-    """Pre-compute CP + sensor maps, save as meas/afm_maps.npz.
-    Called from Phase 2 worker so maps are instant on first row expand.
-    Returns True if cache was written or already valid.
+    """Compute maps for preview using strided TDMS reads.
+
+    Only reads GRID×GRID evenly-spaced curves from the TDMS file — never
+    the full file.  For a 1000×1000 scan we read 100 curves (~400KB) not
+    1M curves (3.7GB).  Returns True if a fresh valid cache exists or was
+    just written.
     """
     import numpy as _np
-    from scipy.interpolate import griddata as _gd
+    from scipy.spatial import cKDTree as _KDT
     from pathlib import Path as _P
+    import re as _re
     meas = _P(meas)
     npz  = meas / "afm_maps.npz"
     tdms = meas / "ForceCurve.tdms"
     if not tdms.exists(): return False
+
+    # Skip if cache already fresh + correct version
     if npz.exists() and npz.stat().st_mtime >= tdms.stat().st_mtime:
-        return True  # already fresh
+        try:
+            v = _np.load(str(npz))
+            if int(v.get("_version", _np.array([0]))[0]) == _MAP_CACHE_VERSION:
+                return True   # already good — don't touch TDMS
+        except Exception:
+            pass
+
     xs, ys = _load_sensors(meas)
     if xs is None: return False
     n_pts  = len(xs)
-    D_all, Z_all, _Zs, n_samp = _load_tdms_arrays(meas)
-    if D_all is None or n_samp == 0: return False
-    GRID   = min(100, max(10, int(_np.sqrt(n_pts))))
-    xi = _np.linspace(xs.min(), xs.max(), GRID)
-    yi = _np.linspace(ys.min(), ys.max(), GRID)
-    Xi, Yi = _np.meshgrid(xi, yi)
-    pts = (xs, ys)
-    half  = n_samp // 2
-    D_app = D_all[:n_pts*n_samp].reshape(n_pts, n_samp)[:, :half]
-    Z_app = Z_all[:n_pts*n_samp].reshape(n_pts, n_samp)[:, :half]
+    n_samp = _get_n_samp(meas)
+    if n_samp == 0: return False
 
-    # Return-direction mask (dx < 0)
+    GRID   = min(100, max(10, int(_np.sqrt(n_pts))))
+    xi     = _np.linspace(xs.min(), xs.max(), GRID)
+    yi     = _np.linspace(ys.min(), ys.max(), GRID)
+    Xi, Yi = _np.meshgrid(xi, yi)
+
+    # Return-direction mask
     dx    = _np.diff(xs, prepend=xs[0])
     rmask = dx < 0
     if rmask.sum() < 4: rmask = _np.ones(n_pts, dtype=bool)
-    pts_r = (xs[rmask], ys[rmask])
+    xs_r, ys_r = xs[rmask], ys[rmask]
 
-    # Use only return-direction points (dx < 0) for cleaner maps
-    dx   = _np.diff(xs, prepend=xs[0])
-    rmask = dx < 0
-    pts_r = (xs[rmask], ys[rmask])  # subset positions
-    if rmask.sum() < 4:             # too few — fall back to all points
-        rmask = _np.ones(n_pts, dtype=bool)
-        pts_r = pts
-    n_base = max(5, half//5)
-    bm = D_app[:, :n_base].mean(axis=1, keepdims=True)
-    bs = D_app[:, :n_base].std(axis=1,  keepdims=True).clip(min=1e-6)
-    above = D_app > (bm + 5*bs)
-    any_a = above.any(axis=1)
-    fi    = _np.where(any_a, above.argmax(axis=1), half-1)
-    cp    = Z_app[_np.arange(n_pts), fi].copy()
-    cp[~any_a]    = Z_app[~any_a].max(axis=1)
-    cp[above[:,0]]= Z_app[above[:,0], 0]
-    cp_grid = _gd(pts_r, cp[rmask], (Xi, Yi), method="nearest").astype(_np.float32)
-    arrays  = {"cp": cp_grid,
-               "xi": xi.astype(_np.float32), "yi": yi.astype(_np.float32),
-               "x_raw": xs.astype(_np.float32), "y_raw": ys.astype(_np.float32),
-               "grid_n": _np.array([GRID], dtype=_np.int32)}
+    # ── Strided curve selection ───────────────────────────────────────────────
+    # Pick at most GRID×GRID evenly-spaced curves from the return-direction set.
+    # This means we read ~10KB per curve × 100 curves = ~1MB regardless of
+    # how large the TDMS file is.
+    ret_indices = _np.where(rmask)[0]  # FC indices that are return-direction
+    n_ret = len(ret_indices)
+    n_want = min(n_ret, GRID * GRID * 4)  # 4× oversample for better coverage
+    stride  = max(1, n_ret // n_want)
+    sel     = ret_indices[::stride][:n_want]  # selected FC indices
+
+    # Read only the selected curves from TDMS
+    half = n_samp // 2
+    nb   = max(5, half // 5)
+    try:
+        from nptdms import TdmsFile as _TF
+        _tdms = _TF.open(str(tdms))  # lazy open — no full read
+        _ch_D = _tdms["Forcecurve"].channels()[0]
+        _ch_Z = _tdms["Forcecurve"].channels()[1]
+        cp_sel = _np.empty(len(sel), dtype=_np.float32)
+        for out_i, fc_i in enumerate(sel):
+            s = int(fc_i) * n_samp
+            D = _np.array(_ch_D[s:s+half], dtype=_np.float32)
+            Z = _np.array(_ch_Z[s:s+half], dtype=_np.float32)
+            bm = D[:nb].mean(); bs = max(float(D[:nb].std()), 1e-6)
+            above = _np.where(D > bm + 5*bs)[0]
+            cp_i  = int(above[0]) if len(above) else half - 1
+            if cp_i == 0 and len(above) == 0: cp_i = half - 1  # no contact
+            cp_sel[out_i] = Z[cp_i]
+    except Exception:
+        return False
+
+    # ── Grid using only selected points ──────────────────────────────────────
+    xs_sel = xs_r[_np.searchsorted(ret_indices, sel)]  # positions of sel curves
+    ys_sel = ys_r[_np.searchsorted(ret_indices, sel)]
+    qpts   = _np.column_stack([Xi.ravel(), Yi.ravel()])
+    tree   = _KDT(_np.column_stack([xs_sel, ys_sel]))
+    _, idx = tree.query(qpts, workers=-1)
+    cp_grid = cp_sel[idx].reshape(GRID, GRID)
+
+    # grid_to_fc: each grid cell → the actual FC index in the full scan
+    g2f = sel[idx].astype(_np.int32)
+
+    arrays = dict(cp=cp_grid.astype(_np.float32),
+                  xi=xi.astype(_np.float32), yi=yi.astype(_np.float32),
+                  x_raw=xs, y_raw=ys,
+                  grid_to_fc=g2f,
+                  grid_n=_np.array([GRID], dtype=_np.int32),
+                  _version=_np.array([_MAP_CACHE_VERSION], dtype=_np.int32))
+
+    # Sensor text maps (ZSamplePID, ZTipoffsets) — these are cheap txt files
     for fname, key in [("ZSamplePID.txt","zpid"), ("ZTipoffsets.txt","ztip")]:
         p = meas / fname
         if p.exists():
             try:
                 v = _fast_load_txt(p).astype(_np.float32)
-                if len(v)==n_pts:
-                    arrays[key] = _gd(pts_r, v[rmask], (Xi,Yi), method="nearest").astype(_np.float32)
+                if len(v) == n_pts:
+                    v_sel = v[rmask][_np.searchsorted(ret_indices, sel)]
+                    arrays[key] = v_sel[idx].reshape(GRID, GRID)
             except Exception: pass
+
     try:
-        arrays["_version"] = _np.array([_MAP_CACHE_VERSION], dtype=_np.int32)
         _np.savez_compressed(str(npz), **arrays)
         return True
     except Exception:
@@ -576,7 +546,7 @@ def scan_stream():
             ctx = multiprocessing.get_context("spawn")
             with ctx.Pool(processes=n_cores) as pool:
                 for folder_str, result in pool.imap_unordered(
-                        _stage_worker, pf_folders_to_scan, chunksize=1):
+                        _workers.stage_worker, pf_folders_to_scan, chunksize=1):
                     done2 += 1
                     if result:
                         yield ev({"type":"stage","folder":folder_str,
@@ -744,12 +714,27 @@ def get_maps(folder: str):
             if "cp"   in npz.files: result["maps"]["CP"]             = _nm(npz["cp"])
             if "zpid" in npz.files: result["maps"]["ZSamplePID.txt"] = _nm(npz["zpid"])
             if "ztip" in npz.files: result["maps"]["ZTipoffsets.txt"]= _nm(npz["ztip"])
-            result["n_curves"] = len(npz["x_raw"])
-            result["x_coords"] = [round(float(v),4) for v in npz["xi"].tolist()]
-            result["y_coords"] = [round(float(v),4) for v in npz["yi"].tolist()]
-            result["x_raw"]    = [round(float(v),4) for v in npz["x_raw"].tolist()]
-            result["y_raw"]    = [round(float(v),4) for v in npz["y_raw"].tolist()]
+            _xr = npz["x_raw"]; _yr = npz["y_raw"]
+            _xi2 = npz["xi"];   _yi2 = npz["yi"]
+            n_raw = len(_xr)
+            result["n_curves"] = n_raw
+            result["x_coords"] = [round(float(v),4) for v in _xi2.tolist()]
+            result["y_coords"] = [round(float(v),4) for v in _yi2.tolist()]
             result["grid_n"]   = GRID2
+            # grid_to_fc: for each grid cell, the nearest raw FC index
+            # replaces x_raw/y_raw (saves 15MB for 1M-point scans)
+            if "grid_to_fc" in npz.files:
+                result["grid_to_fc"] = npz["grid_to_fc"].tolist()
+            else:
+                # Fallback: build on the fly from x_raw/y_raw
+                from scipy.spatial import cKDTree as _KDT3
+                _qp = _np2.column_stack([
+                    _np2.tile(_xi2, GRID2),
+                    _np2.repeat(_yi2, GRID2)])
+                _, _fc_idx = _KDT3(_np2.column_stack([_xr,_yr])).query(_qp, workers=-1)
+                result["grid_to_fc"] = _fc_idx.tolist()
+                result["x_raw"]    = [round(float(v),4) for v in _xr.tolist()]
+                result["y_raw"]    = [round(float(v),4) for v in _yr.tolist()]
             result["timings"]["npz_load"] = round((_time.time()-_ts)*1000)
             _maps_cache[_map_key] = (result, _map_mtime)
             return _safe_json(result)
@@ -759,108 +744,35 @@ def get_maps(folder: str):
     result["timings"]["npz_miss"] = round((_time.time()-_ts)*1000)
     _ts = _time.time()
 
-    # ── Slow path: compute from raw files ─────────────────────────────────────
-    xs, ys = _load_sensors(meas)
-    result["timings"]["load_sensors"] = round((_time.time()-_ts)*1000)
+    # ── Slow path: compute maps using strided TDMS reads, then load npz ────────
+    # _compute_and_cache_maps reads only GRID×GRID curves, not the full file
+    ok = _compute_and_cache_maps(meas)
+    result["timings"]["compute"] = round((_time.time()-_ts)*1000)
     _ts = _time.time()
-    if xs is None:
+
+    if ok and (meas/"afm_maps.npz").exists():
+        try:
+            npz2 = _np2.load(str(meas/"afm_maps.npz"))
+            GRID2 = int(npz2["grid_n"][0])
+            def _nm2(arr):
+                flat=[round(float(v),4) for v in arr.ravel()]
+                return {"data":flat,"rows":GRID2,"cols":GRID2,"n":len(flat),
+                        "vmin":round(float(arr.min()),4),"vmax":round(float(arr.max()),4)}
+            if "cp"   in npz2.files: result["maps"]["CP"]             = _nm2(npz2["cp"])
+            if "zpid" in npz2.files: result["maps"]["ZSamplePID.txt"] = _nm2(npz2["zpid"])
+            if "ztip" in npz2.files: result["maps"]["ZTipoffsets.txt"]= _nm2(npz2["ztip"])
+            result["n_curves"] = len(npz2["x_raw"])
+            result["x_coords"] = [round(float(v),4) for v in npz2["xi"].tolist()]
+            result["y_coords"] = [round(float(v),4) for v in npz2["yi"].tolist()]
+            result["grid_to_fc"]= npz2["grid_to_fc"].tolist()
+            result["grid_n"]   = GRID2
+            result["timings"]["npz_load2"] = round((_time.time()-_ts)*1000)
+        except Exception as _ex:
+            result["timings"]["npz_err"] = str(_ex)
+
+    # Only cache if we actually got some maps — don't poison cache with failures
+    if result.get("maps"):
         _maps_cache[_map_key] = (result, _map_mtime)
-        return _safe_json(result)
-
-    n_pts = len(xs)
-    if n_pts == 0 or len(ys) != n_pts:
-        return _safe_json(result)
-
-    # ── Build output grid ─────────────────────────────────────────────────────
-    GRID = min(100, max(10, int(_np.sqrt(n_pts))))
-    xi = _np.linspace(xs.min(), xs.max(), GRID)
-    yi = _np.linspace(ys.min(), ys.max(), GRID)
-    Xi, Yi = _np.meshgrid(xi, yi)
-    pts = (xs, ys)
-
-    def gridmap(values, gpts=None, mask=None):
-        """Grid irregular values onto GRID×GRID, return sanitised flat list."""
-        from scipy.interpolate import griddata as _gd
-        _pts = gpts if gpts is not None else pts
-        _vals = values[mask] if mask is not None else values
-        g = _gd(_pts, _vals, (Xi, Yi), method="nearest")
-        flat = g.ravel()
-        clean = [None if (_math.isnan(v) or _math.isinf(v)) else round(float(v), 5)
-                 for v in flat]
-        vvalid = [v for v in clean if v is not None]
-        vmin = min(vvalid) if vvalid else 0.0
-        vmax = max(vvalid) if vvalid else 1.0
-        return {"data": clean, "rows": GRID, "cols": GRID,
-                "n": len(clean), "vmin": vmin, "vmax": vmax}
-
-    # ── Return-direction mask (dx < 0 on X sensor) ───────────────────────────
-    _dx    = _np.diff(xs, prepend=xs[0])
-    rmask  = _dx < 0
-    if rmask.sum() < 4: rmask = _np.ones(n_pts, dtype=bool)
-    pts_r  = (xs[rmask], ys[rmask])
-
-    # ── Sensor text files ─────────────────────────────────────────────────────
-    for fname in ["ZSamplePID.txt", "ZTipoffsets.txt"]:
-        p = meas / fname
-        if not p.exists():
-            continue
-        try:
-            vals = _fast_load_txt(p)
-            if len(vals) == n_pts:
-                result["maps"][fname] = gridmap(vals, pts_r, rmask)
-        except Exception:
-            pass
-
-    result["timings"]["sensor_maps"] = round((_time.time()-_ts)*1000)
-    _ts = _time.time()
-
-    # ── TDMS force curve maps ─────────────────────────────────────────────────
-    if (meas / "ForceCurve.tdms").exists():
-        try:
-            D_all, Z_all, _Zs, n_samp = _load_tdms_arrays(meas)
-            if D_all is not None and n_samp > 0:
-                result["n_curves"] = n_pts
-                half  = n_samp // 2
-                D_all = D_all[:n_pts * n_samp].reshape(n_pts, n_samp)
-                Z_all = Z_all[:n_pts * n_samp].reshape(n_pts, n_samp)
-                D_app = D_all[:, :half]
-                Z_app = Z_all[:, :half]
-
-                # ── Contact point detection ────────────────────────────────────
-                # Baseline = first 20% of approach; CP = first index where
-                # D exceeds baseline + 5*sigma.
-                # flat curve (no contact): CP = Z_app.max()
-                # already in contact:      CP = Z_app[:,0]
-                n_base = max(5, half // 5)
-                b_mean = D_app[:, :n_base].mean(axis=1, keepdims=True)
-                b_std  = D_app[:, :n_base].std(axis=1, keepdims=True).clip(min=1e-6)
-                above  = D_app > (b_mean + 5 * b_std)
-
-                any_above  = above.any(axis=1)
-                first_idx  = _np.where(any_above, above.argmax(axis=1), half - 1)
-                rows       = _np.arange(n_pts)
-                cp_z       = Z_app[rows, first_idx]
-                cp_z[~any_above]   = Z_app[~any_above].max(axis=1)   # no contact
-                cp_z[above[:, 0]]  = Z_app[above[:, 0], 0]           # full contact
-
-                result["maps"]["CP"] = gridmap(cp_z, pts_r, rmask)
-        except Exception:
-            pass   # CP map skipped on error
-
-    result["timings"]["tdms_cp"] = round((_time.time()-_ts)*1000)
-
-    # ── Grid axis coords (for crosshair position) ─────────────────────────────
-    # Use float32 precision (4 sig figs) — sensor positions don't need 6 decimals
-    result["x_coords"] = [round(float(v), 4) for v in xi.tolist()]
-    result["y_coords"] = [round(float(v), 4) for v in yi.tolist()]
-    result["x_raw"]    = [round(float(v), 4) for v in xs.tolist()]
-    result["y_raw"]    = [round(float(v), 4) for v in ys.tolist()]
-    result["grid_n"]   = GRID
-
-    # Save npz cache so next expand is fast
-    try: _compute_and_cache_maps(meas)
-    except Exception: pass
-    _maps_cache[_map_key] = (result, _map_mtime)
     return _safe_json(result)
 
 
@@ -879,22 +791,34 @@ def get_fc(folder: str, index: int = 0):
     try:
         import numpy as _np
 
-        # Use cached TDMS arrays — no re-open on every slider move
-        D_arr, Z_arr, Zs_arr, n_samp = _load_tdms_arrays(meas)
-        if D_arr is None:
-            raise HTTPException(status_code=500, detail="Could not read TDMS channels")
-
-        n_curves = max(1, len(D_arr) // n_samp)
-        idx = max(0, min(index, n_curves - 1))
-        s, e = idx * n_samp, (idx + 1) * n_samp
+        n_samp = _get_n_samp(meas)
 
         def clean(arr):
             return [None if (_math.isnan(float(v)) or _math.isinf(float(v))) else round(float(v), 6)
                     for v in arr]
 
-        d  = clean(D_arr[s:e])
-        z  = clean(Z_arr[s:e])
-        zs = clean(Zs_arr[s:e]) if len(Zs_arr) > e else []
+        # Try cache first (fast for small/medium scans already loaded)
+        D_arr, Z_arr, Zs_arr, n_samp_c = _load_tdms_arrays(meas)
+        if D_arr is not None:
+            n_samp   = n_samp_c
+            n_curves = max(1, len(D_arr) // n_samp)
+            idx      = max(0, min(index, n_curves - 1))
+            s, e     = idx * n_samp, (idx + 1) * n_samp
+            d  = clean(D_arr[s:e])
+            z  = clean(Z_arr[s:e])
+            zs = clean(Zs_arr[s:e]) if len(Zs_arr) > e else []
+        else:
+            # Large file: lazy open, slice just one curve — no full array load
+            from nptdms import TdmsFile as _TF
+            tdms     = _TF.open(str(tdms_path))
+            chs      = tdms["Forcecurve"].channels()
+            n_total  = len(chs[0])
+            n_curves = max(1, n_total // n_samp)
+            idx      = max(0, min(index, n_curves - 1))
+            s, e     = idx * n_samp, (idx + 1) * n_samp
+            d  = clean(_np.array(chs[0][s:e], dtype=_np.float32))
+            z  = clean(_np.array(chs[1][s:e], dtype=_np.float32))
+            zs = clean(_np.array(chs[2][s:e], dtype=_np.float32)) if len(chs) > 2 else []
 
         # Sensor position (cached)
         x_pos, y_pos = None, None
@@ -994,7 +918,7 @@ def fv_maps_stream(folder: str):
         done = 0
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=n_cores) as pool:
-            for res in pool.imap_unordered(_fv_worker, args_list, chunksize=4):
+            for res in pool.imap_unordered(_workers.fv_worker, args_list, chunksize=4):
                 idx, zm, ds, cp, E_val = res
                 results[idx] = (zm, ds, cp, E_val)
                 done += 1
@@ -1010,10 +934,29 @@ def fv_maps_stream(folder: str):
         valid_t = topo[_np.isfinite(topo)]
         if len(valid_t): topo -= _np.median(valid_t)
 
-        # Grid layout: reshape to (ny, nx)
-        rows, cols = ny, nx
-        topo_grid = topo[:rows*cols].reshape(rows, cols)
-        E_grid    = E_arr[:rows*cols].reshape(rows, cols)
+        # ── Handle complete vs incomplete scans ──────────────────────────────
+        cols         = nx
+        is_complete  = (n_files >= nx * ny)
+
+        if is_complete:
+            rows        = ny
+            n_data_rows = ny   # all rows are data rows
+            topo_grid   = topo[:rows*cols].reshape(rows, cols)
+            E_grid      = E_arr[:rows*cols].reshape(rows, cols)
+        else:
+            # Interrupted scan: keep data rows + 3 empty padding rows
+            n_complete_rows = n_files // cols
+            n_partial       = n_files % cols
+            n_data_rows     = n_complete_rows + (1 if n_partial > 0 else 0)
+            EXTRA_ROWS      = 3
+            rows            = n_data_rows + EXTRA_ROWS
+            total_cells     = rows * cols
+            topo_pad        = _np.full(total_cells, _np.nan, dtype=_np.float32)
+            E_pad           = _np.full(total_cells, _np.nan, dtype=_np.float32)
+            topo_pad[:n_files] = topo[:n_files]
+            E_pad[:n_files]    = E_arr[:n_files]
+            topo_grid = topo_pad.reshape(rows, cols)
+            E_grid    = E_pad.reshape(rows, cols)
 
         def _mg(grid):
             flat = grid.ravel().tolist()
@@ -1024,13 +967,16 @@ def fv_maps_stream(folder: str):
                     "vmin":round(min(vld),4) if vld else 0,
                     "vmax":round(max(vld),4) if vld else 1}
 
-        # X/Y positions for crosshair
+        # X/Y positions for crosshair — only for actual data points
         xs = _np.array([(i % cols) * (xlength / max(cols-1,1)) for i in range(rows*cols)],
                         dtype=_np.float32)
         ys = _np.array([(i // cols) * (ylength / max(rows-1,1)) for i in range(rows*cols)],
                         dtype=_np.float32)
-        xi = _np.linspace(0, xlength, cols) if xlength > 0 else _np.arange(cols, dtype=_np.float32)
-        yi = _np.linspace(0, ylength, rows) if ylength > 0 else _np.arange(rows, dtype=_np.float32)
+        # y coords span only the data rows (not the padding)
+        y_data_end = ylength * n_data_rows / max(ny, 1) if ylength > 0 else n_data_rows
+        y_pad_end  = y_data_end * rows / max(n_data_rows, 1)
+        xi = _np.linspace(0, xlength,   cols) if xlength > 0 else _np.arange(cols, dtype=_np.float32)
+        yi = _np.linspace(0, y_pad_end, rows) if ylength > 0 else _np.arange(rows, dtype=_np.float32)
 
         yield ev({"type":"done",
                   "topo": _mg(topo_grid),
@@ -1040,7 +986,9 @@ def fv_maps_stream(folder: str):
                   "y_raw":    [round(float(v),3) for v in ys],
                   "x_coords": [round(float(v),3) for v in xi],
                   "y_coords": [round(float(v),3) for v in yi],
-                  "grid_n":   cols})
+                  "grid_n":   cols,
+                  "partial":  not is_complete,
+                  "x_um": xlength, "y_um": ylength})
 
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
@@ -1063,7 +1011,7 @@ def get_fv_fc(folder: str, index: int = 0):
     idx = max(0, min(index, len(lvm_files)-1))
     INVOLS = 0.1686; StIV = 30.0; k = 0.09; nu = 0.5; alpha = 17.5
 
-    res = _fv_worker((str(lvm_files[idx]), idx, INVOLS, StIV, k, 8, 3, 10, nu, alpha))
+    res = _workers.fv_worker((str(lvm_files[idx]), idx, INVOLS, StIV, k, 8, 3, 10, nu, alpha))
     _, zm, ds, cp, E_val = res
     nx = len(lvm_files)
 
@@ -1139,38 +1087,49 @@ async def fv_export(request: "Request"):
         _, tlo, thi = _clip(T, clip_pct)
         _, elo, ehi = _clip(E, clip_pct)
 
+        # Physical aspect ratio — y_um/x_um gives correct shape
+        phys_aspect = (y_um / x_um) if x_um > 0 and y_um > 0 else (rows / max(cols, 1))
+
         OUT = 512
         if interp:
-            # Correct aspect: expand each axis proportionally
-            if rows >= cols:
-                out_r, out_c = OUT, max(1, round(OUT * cols / rows))
+            # Upsample to 512 on the long axis, preserving physical aspect
+            if phys_aspect >= 1:   # taller than wide
+                out_r = OUT; out_c = max(1, round(OUT / phys_aspect))
             else:
-                out_r, out_c = max(1, round(OUT * rows / cols)), OUT
+                out_c = OUT; out_r = max(1, round(OUT * phys_aspect))
             T_p = _upsample_spline(T, out_r, out_c)
             E_p = _upsample_spline(E, out_r, out_c)
+            # After spline upsample the pixel grid already matches physical aspect
+            img_aspect = 'equal'
+            interp_method = 'bilinear'
         else:
+            # No interpolation: each raw data point = one pixel
+            # Use imshow extent to set correct physical dimensions
             T_p, E_p = T, E
+            img_aspect = 'equal'   # enforce physical aspect via extent
+            interp_method = 'nearest'
 
-        # Figure physical size: each map is 3 cm wide × correct aspect
-        phys_aspect = (y_um / x_um) if x_um > 0 and y_um > 0 else (rows / max(cols, 1))
-        map_w_in = 1.7   # inches per map
-        map_h_in = map_w_in * phys_aspect
-        map_h_in = max(0.8, min(4.0, map_h_in))   # clamp
-        fig_w    = map_w_in * 2 + 1.6              # two maps + colorbars + gap
-        fig_h    = map_h_in + 0.7                  # maps + title space
+        # Figure size: fixed map width, height from physical aspect
+        map_w_in = 1.7
+        map_h_in = max(0.8, min(5.0, map_w_in * phys_aspect))
+        fig_w    = map_w_in * 2 + 1.6
+        fig_h    = map_h_in + 0.7
 
         fig, axes = plt.subplots(1, 2, figsize=(fig_w, fig_h))
-        fig.patch.set_alpha(0)   # transparent background
+        fig.patch.set_alpha(0)
+
+        # extent sets physical coordinates so aspect='equal' gives correct shape
+        _ext = [0, x_um if x_um > 0 else cols, y_um if y_um > 0 else rows, 0]
 
         specs = [
-            (axes[0], T_p, tlo, thi, "viridis",  "Topography",     "μm",   True),
-            (axes[1], E_p, elo, ehi, "inferno",  "Elasticity (E)", "kPa",  False),
+            (axes[0], T_p, tlo, thi, 'viridis',  'Topography',     'μm',   True),
+            (axes[1], E_p, elo, ehi, 'inferno',  'Elasticity (E)', 'kPa',  False),
         ]
         for ax, data, vlo, vhi, cmap, title_str, unit, add_sb in specs:
             im = ax.imshow(data, cmap=cmap, vmin=vlo, vmax=vhi,
-                           origin="upper",
-                           interpolation="none",   # data is already upsampled
-                           aspect="equal" if interp else "auto")
+                           origin='upper', extent=_ext,
+                           interpolation=interp_method,
+                           aspect=img_aspect)
 
             # Black outline
             for sp in ax.spines.values():
@@ -1190,16 +1149,17 @@ async def fv_export(request: "Request"):
 
             # Scale bar (25% width, bottom-left)
             if add_sb and x_um > 0:
-                h_px, w_px = data.shape
+                # Scale bar in physical units (um) using axes data coordinates
                 sb_frac = 0.25
                 sb_um   = x_um * sb_frac
-                bar_len = w_px * sb_frac
-                x0 = w_px * 0.05; y0 = h_px * 0.93
-                ax.plot([x0, x0+bar_len],[y0, y0], color="white",
-                        linewidth=2.0, solid_capstyle="butt", zorder=5)
+                x0_d    = x_um * 0.04
+                y0_d    = (y_um if y_um > 0 else rows) * 0.94
+                ax.plot([x0_d, x0_d+sb_um], [y0_d, y0_d], color='white',
+                        linewidth=2.0, solid_capstyle='butt',
+                        transform=ax.transData, zorder=5)
                 lbl = f"{sb_um:.0f} μm" if sb_um >= 1 else f"{sb_um*1000:.0f} nm"
-                ax.text(x0+bar_len/2, y0-h_px*0.04, lbl,
-                        color="white", fontsize=6, ha="center", va="bottom", zorder=5)
+                ax.text(x0_d+sb_um/2, y0_d-(y_um if y_um>0 else rows)*0.04, lbl,
+                        color='white', fontsize=6, ha='center', va='bottom', zorder=5)
 
         plt.tight_layout(pad=0.5, w_pad=0.6)
 
@@ -1217,6 +1177,32 @@ async def fv_export(request: "Request"):
         return _safe_json({"error": str(e), "traceback": traceback.format_exc()})
 
 
+@app.get("/api/clear-map-cache")
+def clear_map_cache(folder: str):
+    """Delete afm_maps.npz and clear RAM caches for this folder.
+    Forces /api/maps to recompute from scratch on next request.
+    """
+    meas = Path(folder)
+    npz  = meas / "afm_maps.npz"
+    deleted = False
+    if npz.exists():
+        try: npz.unlink(); deleted = True
+        except Exception as e: return _safe_json({"ok": False, "error": str(e)})
+    # Clear RAM caches for this folder
+    key = str(meas)
+    _maps_cache.pop(key, None)
+    _sensor_cache.pop(key, None)
+    if key in _tdms_lru:
+        _tdms_lru.remove(key)
+        _tdms_cache.pop(key, None)
+    return _safe_json({"ok": True, "deleted": deleted, "folder": folder})
+
+
 @app.get("/api/health")
 def health():
     return _safe_json({"status": "ok", "root": _current_root})
+
+
+# Windows: prevent recursive spawning when running as frozen exe
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
