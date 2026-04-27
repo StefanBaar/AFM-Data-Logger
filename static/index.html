@@ -838,19 +838,26 @@ function loadMaps(panel, d){
     }
   }
 
-  step(5, 'Requesting /api/maps…', '/api/maps → sent');
+  step(5, 'Connecting…', '');
 
-  fetch('/api/maps?folder='+encodeURIComponent(folder))
-    .then(function(r){ step(25,'Server responded — reading body…','/api/maps response'); return r.text(); })
-    .then(function(t){ step(40,'Parsing JSON…','body received ('+t.length+' bytes)'); return JSON.parse(t); })
-    .then(function(body){
-      // Show server-side timing breakdown
-      var tim = body.timings || {};
-      var timStr = '';
-      if(tim.load_sensors!=null) timStr += 'load sensors: '+tim.load_sensors+'ms  ';
-      if(tim.sensor_maps!=null)  timStr += 'sensor maps: '+tim.sensor_maps+'ms  ';
-      if(tim.tdms_cp!=null)      timStr += 'TDMS+CP: '+tim.tdms_cp+'ms';
-      step(55,'Building maps…','server breakdown: '+timStr);
+  var _es = new EventSource('/api/maps?folder='+encodeURIComponent(folder));
+  _es.onmessage = function(ev_msg){
+    var msg; try{ msg=JSON.parse(ev_msg.data); }catch(e){ return; }
+
+    if(msg.type==='progress'){
+      step(msg.pct||10, msg.label||'Processing…', '');
+      return;
+    }
+    if(msg.type==='error'){
+      step(100,'Error: '+msg.message,'');
+      _es.close(); return;
+    }
+    if(msg.type!=='done') return;
+    _es.close();
+
+    var body = msg;
+    step(97,'Rendering maps…','');
+    (function(){
 
       var maps    = body.maps    || {};
       var names   = Object.keys(maps);
@@ -890,27 +897,50 @@ function loadMaps(panel, d){
 
       // ── maps ──────────────────────────────────────────────────────────────
       var mapCanvases = [];
+      var pfClipPct = 5;
+      var pfMapsRaw = {};  // store originals for re-clipping
+
+      function pfApplyClip(m, pct){
+        var vals=m.data.filter(function(v){return v!=null&&isFinite(v);});
+        vals.sort(function(a,b){return a-b;});
+        var lo=vals[Math.floor(vals.length*pct/100)]||m.vmin;
+        var hi=vals[Math.ceil(vals.length*(1-pct/100))-1]||m.vmax;
+        return Object.assign({},m,{vmin:lo,vmax:hi});
+      }
+
+      function pfUpdateClip(){
+        mapCanvases.forEach(function(mc){
+          var raw=pfMapsRaw[mc.name];
+          if(!raw) return;
+          mc.m=pfApplyClip(raw,pfClipPct);
+          mc.cv._base=null; mc.cv._baseImg=null;
+          drawMap(mc.cv,mc.m,null);
+        });
+      }
+
       if(names.length){
         var tDraw = performance.now();
         names.forEach(function(name){
           var m = maps[name];
+          pfMapsRaw[name] = m;
+          var mc_m = pfApplyClip(m, pfClipPct);
           var wrap = document.createElement('div'); wrap.className='xmap';
           var ttl  = document.createElement('div'); ttl.className='xmap-title';
           ttl.textContent = name; wrap.appendChild(ttl);
           var mc=initMapCanvas(GRID,GRID,cW,cH);
           mc.data._overlay=mc.overlay;
-          drawMap(mc.data,m,null);
+          drawMap(mc.data,mc_m,null);
           var cbWrap=document.createElement('div'); cbWrap.className='xmap-cb';
-          var cbMax=document.createElement('span'); cbMax.textContent=fmtCb(m.vmax);
+          var cbMax=document.createElement('span'); cbMax.textContent=fmtCb(mc_m.vmax);
           var cbCv=document.createElement('canvas'); cbCv.width=8; cbCv.height=cH;
           cbCv.style.cssText='width:8px;height:'+cH+'px';
           drawColorbar(cbCv);
-          var cbMin=document.createElement('span'); cbMin.textContent=fmtCb(m.vmin);
+          var cbMin=document.createElement('span'); cbMin.textContent=fmtCb(mc_m.vmin);
           cbWrap.appendChild(cbMax); cbWrap.appendChild(cbCv); cbWrap.appendChild(cbMin);
           var mwrap=document.createElement('div'); mwrap.className='xmap-wrap';
           mwrap.appendChild(mc.wrap); mwrap.appendChild(cbWrap);
           wrap.appendChild(mwrap);
-          mapCanvases.push({cv:mc.data,m:m});
+          mapCanvases.push({cv:mc.data,m:mc_m,name:name});
           mc.overlay.addEventListener('click',function(e){
             var rect=mc.overlay.getBoundingClientRect();
             var fi=pixelToFCIdx(mc.overlay,e.clientX-rect.left,e.clientY-rect.top);
@@ -920,6 +950,86 @@ function loadMaps(panel, d){
         });
         step(70,'Drawing maps done — fetching FC…',
           names.length+' map(s) rendered in '+(performance.now()-tDraw).toFixed(0)+'ms');
+
+        // ── controls column: clip + interpolate + download ────────────────
+        var ctrlWrap=document.createElement('div');
+        ctrlWrap.style='display:flex;flex-direction:column;gap:8px;min-width:150px;max-width:180px';
+
+        var clipTtl=document.createElement('div'); clipTtl.className='xmap-title';
+        clipTtl.textContent='Outlier clip'; ctrlWrap.appendChild(clipTtl);
+        var clipRow=document.createElement('div'); clipRow.style='display:flex;align-items:center;gap:6px';
+        var clipSlider=document.createElement('input');
+        clipSlider.type='range'; clipSlider.min=0; clipSlider.max=25; clipSlider.value=pfClipPct; clipSlider.step=1;
+        clipSlider.style='flex:1;accent-color:var(--pf)';
+        var clipLbl=document.createElement('span');
+        clipLbl.style='font-family:var(--mono);font-size:.62rem;color:var(--dim);white-space:nowrap';
+        clipLbl.textContent=pfClipPct+'%';
+        clipSlider.addEventListener('input',function(){
+          pfClipPct=parseInt(clipSlider.value); clipLbl.textContent=pfClipPct+'%';
+          pfUpdateClip();
+        });
+        clipRow.appendChild(clipSlider); clipRow.appendChild(clipLbl);
+        ctrlWrap.appendChild(clipRow);
+        var clipNote=document.createElement('div');
+        clipNote.style='font-family:var(--mono);font-size:.58rem;color:var(--dim);margin-top:-4px';
+        clipNote.textContent='clips top + bottom %'; ctrlWrap.appendChild(clipNote);
+
+        var interpRow=document.createElement('div'); interpRow.style='display:flex;align-items:center;gap:7px;margin-top:4px';
+        var interpChk=document.createElement('input');
+        interpChk.type='checkbox'; interpChk.id='pf_interp_'+Date.now();
+        interpChk.style='accent-color:var(--pf);width:14px;height:14px;cursor:pointer';
+        var interpLbl=document.createElement('label'); interpLbl.htmlFor=interpChk.id;
+        interpLbl.style='font-family:var(--mono);font-size:.65rem;color:var(--dim);cursor:pointer';
+        interpLbl.textContent='Interpolate (1024\u00b2)';
+        interpRow.appendChild(interpChk); interpRow.appendChild(interpLbl);
+        ctrlWrap.appendChild(interpRow);
+
+        var dlBtn=document.createElement('button');
+        dlBtn.className='btn bp'; dlBtn.style='margin-top:4px;font-size:.68rem';
+        dlBtn.textContent='\u2193 Download PDF';
+        dlBtn.addEventListener('click',function(){
+          dlBtn.textContent='Generating\u2026'; dlBtn.disabled=true;
+          var mapsPayload={};
+          names.forEach(function(name){
+            var raw=pfMapsRaw[name];
+            if(raw) mapsPayload[name]={data:raw.data,rows:raw.rows,cols:raw.cols,vmin:raw.vmin,vmax:raw.vmax};
+          });
+          var xUmVal=(d.x_length||0)*(d.x_step||1);
+          var yUmVal=(d.y_length||0)*(d.y_step||1);
+          fetch('/api/pf-export',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+              maps: mapsPayload,
+              x_um: xUmVal, y_um: yUmVal,
+              clip_pct: pfClipPct,
+              interpolate: interpChk.checked,
+              sample_name: d.cantilever||''
+            })
+          })
+          .then(function(r){
+            var ct=r.headers.get('content-type')||'';
+            if(ct.indexOf('json')>=0) return r.json().then(function(j){throw new Error(j.error||'export failed');});
+            return r.blob();
+          })
+          .then(function(blob){
+            var fname='pf_maps.pdf';
+            var url=URL.createObjectURL(blob);
+            var a=document.createElement('a'); a.href=url; a.download=fname;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            dlBtn.textContent='\u2193 Download PDF'; dlBtn.disabled=false;
+          })
+          .catch(function(e){dlBtn.textContent='Error: '+e.message.slice(0,20); dlBtn.disabled=false;});
+        });
+        ctrlWrap.appendChild(dlBtn);
+        panel.insertBefore(ctrlWrap, pb);
+
+        // ── divider between controls and FC panel ─────────────────────────
+        var div2=document.createElement('div');
+        div2.style='width:1px;background:var(--bdh);margin:0 6px;align-self:stretch';
+        panel.insertBefore(div2, pb);
+
       } else {
         var em=document.createElement('div'); em.className='xmap-empty';
         em.textContent='No sensor file (Xsensors.txt needed)';
@@ -963,12 +1073,8 @@ function loadMaps(panel, d){
       function loadFC(idx){
         if(busy){pend=idx;return;} busy=true;
         var tFC=performance.now();
-        if(firstFC) step(85,'Fetching FC '+idx+'…','');
         fetch('/api/fc?folder='+encodeURIComponent(folder)+'&index='+idx)
-          .then(function(r){
-            if(firstFC) step(92,'FC response — parsing…','/api/fc responded in '+(performance.now()-tFC).toFixed(0)+'ms');
-            return r.text();
-          })
+          .then(function(r){ return r.text(); })
           .then(function(t){return JSON.parse(t);})
           .then(function(b){
             var tDraw=performance.now();
@@ -985,14 +1091,12 @@ function loadMaps(panel, d){
             }
             if(firstFC){
               firstFC=false;
-              step(100,'Ready \u2713',
-                'FC drawn in '+(performance.now()-tDraw).toFixed(0)+'ms  |  total: '+ms());
-              // Shrink to just the log after 5s, keep timings visible
+              step(100,'Ready \u2713 ('+ms()+')', '');
               setTimeout(function(){
-                pbFill.parentNode.removeChild(pbFill.parentNode); // remove track row
-                pbLabel.textContent = 'Loaded \u2713  ('+ms()+')';
+                pbLabel.textContent='Ready \u2713';
                 pbTrack.style.display='none';
-              }, 5000);
+                pbLog.style.display='none';
+              }, 3000);
             }
             busy=false;
             if(pend!=null){var p=pend;pend=null;loadFC(p);}
@@ -1009,10 +1113,12 @@ function loadMaps(panel, d){
 
       slider.addEventListener('input',function(){loadFC(parseInt(slider.value));});
       loadFC(0);
-    })
-    .catch(function(e){
-      panel.innerHTML='<span style="font-family:var(--mono);font-size:.65rem;color:var(--er)">Error: '+e.message+'</span>';
-    });
+    })();  // end IIFE
+  };  // end onmessage
+  _es.onerror = function(){
+    _es.close();
+    step(100,'Connection error','');
+  };
 }
 
 // ── progress bar helpers ────────────────────────────────────────────────────
