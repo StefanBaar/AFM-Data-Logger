@@ -12,7 +12,7 @@ from pathlib import Path
 # Ensure afm_io is importable from worker processes
 sys.path.insert(0, str(Path(__file__).parent))
 
-_MAP_CACHE_VERSION = 3   # must match server.py
+_MAP_CACHE_VERSION = 5   # must match server.py
 
 
 # ── FV LVM worker ─────────────────────────────────────────────────────────────
@@ -174,11 +174,22 @@ def _compute_maps(folder_str: str) -> bool:
     yi     = _np.linspace(ys.min(), ys.max(), GRID)
     Xi, Yi = _np.meshgrid(xi, yi)
 
-    # Strided curve selection
-    n_ret  = len(ret_indices)
-    n_want = min(n_ret, GRID * GRID * 4)
-    stride = max(1, n_ret // n_want)
-    sel    = ret_indices[::stride][:n_want]
+    # Row-uniform curve selection — guarantees all rows are represented
+    # (uniform stride leaves last N rows unsampled → edge artifacts)
+    n_rows_g = max(1, n // nx if nx > 0 else 1)
+    n_per_row = max(1, (GRID * GRID * 4) // n_rows_g)
+    sel_list = []
+    for _r in range(n_rows_g):
+        _rs = _r * nx; _re = _rs + nx
+        _lo = _np.searchsorted(ret_indices, _rs)
+        _hi = _np.searchsorted(ret_indices, _re)
+        _rr = ret_indices[_lo:_hi]
+        if len(_rr) == 0: continue
+        _st = max(1, len(_rr) // n_per_row)
+        sel_list.extend(_rr[::_st][:n_per_row].tolist())
+    sel = _np.array(sel_list, dtype=_np.int64)
+    if len(sel) == 0:
+        sel = ret_indices[::max(1,len(ret_indices)//(GRID*GRID))]
     half   = n_samp // 2
     nb     = max(5, half // 5)
 

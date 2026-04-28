@@ -67,7 +67,7 @@ from afm_io import (discover_all, update_dataset_meta,
 
 
 # Bump this whenever map computation logic changes — forces all npz to regenerate
-_MAP_CACHE_VERSION = 4
+_MAP_CACHE_VERSION = 5
 
 _sensor_cache: dict = {}   # folder -> (xs, ys)
 _maps_cache:   dict = {}   # folder -> (result_dict, mtime)
@@ -183,15 +183,36 @@ def _compute_and_cache_maps(meas) -> bool:
     if rmask.sum() < 4: rmask = _np.ones(n_pts, dtype=bool)
     xs_r, ys_r = xs[rmask], ys[rmask]
 
-    # ── Strided curve selection ───────────────────────────────────────────────
-    # Pick at most GRID×GRID evenly-spaced curves from the return-direction set.
-    # This means we read ~10KB per curve × 100 curves = ~1MB regardless of
-    # how large the TDMS file is.
     ret_indices = _np.where(rmask)[0]  # FC indices that are return-direction
-    n_ret = len(ret_indices)
-    n_want = min(n_ret, GRID * GRID * 4)  # 4× oversample for better coverage
-    stride  = max(1, n_ret // n_want)
-    sel     = ret_indices[::stride][:n_want]  # selected FC indices
+
+    # Get nx (columns per row) from config for row-uniform sampling
+    nx = round(_np.sqrt(n_pts))  # fallback: square grid
+    cfg = meas / "config.txt"
+    if cfg.exists():
+        try:
+            _m = _re.search(r"XStep:\s*([0-9]+)",
+                            cfg.read_text(encoding="utf-8", errors="replace"))
+            if _m: nx = max(1, int(_m.group(1)))
+        except Exception: pass
+    if nx * 2 > n_pts: nx = max(1, round(_np.sqrt(n_pts)))
+
+    # Row-uniform curve selection — guarantees all rows are represented
+    # (uniform stride leaves last N rows unsampled → edge artifacts)
+    n_rows_g = max(1, n_pts // nx)
+    n_per_row = max(1, (GRID * GRID * 4) // n_rows_g)
+    sel_list = []
+    for _r in range(n_rows_g):
+        _rs = _r * nx; _re = _rs + nx
+        _lo = _np.searchsorted(ret_indices, _rs)
+        _hi = _np.searchsorted(ret_indices, _re)
+        _rr = ret_indices[_lo:_hi]
+        if len(_rr) == 0: continue
+        _st = max(1, len(_rr) // n_per_row)
+        sel_list.extend(_rr[::_st][:n_per_row].tolist())
+    sel = _np.array(sel_list, dtype=_np.int64)
+    if len(sel) == 0:
+        sel = ret_indices[::max(1,len(ret_indices)//(GRID*GRID))]
+
 
     # Read only the selected curves from TDMS
     half = n_samp // 2
@@ -771,10 +792,33 @@ def get_maps(folder: str):
         if rmask.sum() < 4: rmask = _np.ones(n_pts, dtype=bool)
         xs_r, ys_r = xs[rmask], ys[rmask]
         ret_indices = _np.where(rmask)[0]
-        n_ret  = len(ret_indices)
-        n_want = min(n_ret, GRID * GRID * 4)
-        stride = max(1, n_ret // n_want)
-        sel    = ret_indices[::stride][:n_want]
+
+        # Read nx from config for row-uniform sampling
+        import re as _re2
+        _nx = 1
+        _cfg = meas / "config.txt"
+        if _cfg.exists():
+            _m = _re2.search(r"XStep:\s*([0-9]+)",
+                             _cfg.read_text(encoding="utf-8", errors="replace"))
+            if _m: _nx = max(1, int(_m.group(1)))
+        if _nx * 2 > n_pts: _nx = max(1, round(_np.sqrt(n_pts)))
+
+        # Row-uniform curve selection — guarantees all rows are represented
+        # (uniform stride leaves last N rows unsampled → edge artifacts)
+        _n_rows_g = max(1, n_pts // _nx)
+        _n_per_row = max(1, (GRID * GRID * 4) // _n_rows_g)
+        _sel_list = []
+        for _r in range(_n_rows_g):
+            _rs = _r * _nx; _re = _rs + _nx
+            _lo = _np.searchsorted(ret_indices, _rs)
+            _hi = _np.searchsorted(ret_indices, _re)
+            _rr = ret_indices[_lo:_hi]
+            if len(_rr) == 0: continue
+            _st = max(1, len(_rr) // _n_per_row)
+            _sel_list.extend(_rr[::_st][:_n_per_row].tolist())
+        sel = _np.array(_sel_list, dtype=_np.int64)
+        if len(sel) == 0:
+            sel = ret_indices[::max(1, len(ret_indices)//(GRID*GRID))]
         half   = n_samp // 2
         nb     = max(5, half // 5)
         n_sel  = len(sel)
