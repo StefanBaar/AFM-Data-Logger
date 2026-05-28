@@ -438,9 +438,13 @@ function loadFVMaps(panel, d, _partialBadgeWrap){
   panel.innerHTML='';
   var pb=document.createElement('div');
   pb.style='display:flex;flex-direction:column;gap:5px;padding:6px 0 8px;min-width:320px;max-width:520px';
+  var pbRow=document.createElement('div');
+  pbRow.style='display:flex;align-items:center;gap:8px';
   var pbLabel=document.createElement('span');
-  pbLabel.style='font-family:var(--mono);font-size:.7rem;color:var(--dim)';
+  pbLabel.style='font-family:var(--mono);font-size:.7rem;color:var(--dim);flex:1';
   pbLabel.textContent='Connecting…';
+  pbRow.appendChild(pbLabel);
+  pb.appendChild(pbRow);
   var pbTrack=document.createElement('div');
   pbTrack.style='background:var(--bg3);border-radius:3px;height:5px;overflow:hidden';
   var pbFill=document.createElement('div');
@@ -448,7 +452,7 @@ function loadFVMaps(panel, d, _partialBadgeWrap){
   pbTrack.appendChild(pbFill);
   var pbLog=document.createElement('div');
   pbLog.style='font-family:var(--mono);font-size:.63rem;line-height:1.8;color:var(--dim);opacity:.85';
-  pb.appendChild(pbLabel); pb.appendChild(pbTrack); pb.appendChild(pbLog);
+  pb.appendChild(pbTrack); pb.appendChild(pbLog);
   panel.appendChild(pb);
 
   function step(pct, label, entry){
@@ -522,6 +526,20 @@ function loadFVMaps(panel, d, _partialBadgeWrap){
     }
     return best;
   }
+
+  // ── Recompute button ───────────────────────────────────────────────────────
+  var fvRecomputeBtn=document.createElement('button');
+  fvRecomputeBtn.className='btn'; fvRecomputeBtn.style='font-size:.62rem;padding:2px 8px;opacity:.7';
+  fvRecomputeBtn.textContent='\u21ba Recompute';
+  fvRecomputeBtn.title='Delete cached data and reprocess all LVM files';
+  fvRecomputeBtn.addEventListener('click',function(){
+    fvRecomputeBtn.disabled=true; fvRecomputeBtn.textContent='Working\u2026';
+    fetch('/api/fv-recompute?folder='+encodeURIComponent(folder))
+      .then(function(r){return r.json();})
+      .then(function(){ panel.innerHTML=''; loadFVMaps(panel,d,_partialBadgeWrap); })
+      .catch(function(){fvRecomputeBtn.textContent='Error';fvRecomputeBtn.disabled=false;});
+  });
+  pbRow.appendChild(fvRecomputeBtn);
 
   // ── SSE stream ─────────────────────────────────────────────────────────────
   var es=new EventSource('/api/fv-maps?folder='+encodeURIComponent(folder));

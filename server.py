@@ -247,7 +247,7 @@ def _compute_and_cache_maps(meas) -> bool:
     g2f = sel[idx].astype(_np.int32)
 
     # ── E map via Sneddon fit on contact region (same strided curves) ─────────
-    _k = 0.2; _nu = 0.5; _alpha_r = _np.radians(17.5); _INVOLS = 0.1
+    _k = 0.2; _nu = 0.5; _alpha_r = _np.radians(17.5); _INVOLS = 0.1686
     E_sel = _np.full(len(sel), _np.nan, dtype=_np.float32)
     try:
         from nptdms import TdmsFile as _TF2
@@ -829,7 +829,7 @@ def get_maps(folder: str):
 
         cp_sel = _np.empty(n_sel, dtype=_np.float32)
         E_sel  = _np.full(n_sel, _np.nan, dtype=_np.float32)
-        _k=0.2; _nu=0.5; _alpha_r=_np.radians(17.5); _INVOLS=0.1
+        _k=0.2; _nu=0.5; _alpha_r=_np.radians(17.5); _INVOLS=0.1686
 
         try:
             from nptdms import TdmsFile as _TF
@@ -1130,6 +1130,18 @@ def fv_maps_stream(folder: str):
         xi = _np.linspace(0, xlength,   cols) if xlength > 0 else _np.arange(cols, dtype=_np.float32)
         yi = _np.linspace(0, y_pad_end, rows) if ylength > 0 else _np.arange(rows, dtype=_np.float32)
 
+        # ── Save full-resolution cache next to config ─────────────────────
+        _npz_fv = meas / "afm_fv_maps.npz"
+        try:
+            _np.savez_compressed(str(_npz_fv),
+                topo=topo_grid, E=E_grid,
+                xi=xi.astype(_np.float32), yi=yi.astype(_np.float32),
+                x_raw=xs.astype(_np.float32), y_raw=ys.astype(_np.float32),
+                xlength=_np.array([xlength], dtype=_np.float32),
+                ylength=_np.array([ylength], dtype=_np.float32),
+                grid=_np.array([rows, cols], dtype=_np.int32))
+        except Exception: pass
+
         yield ev({"type":"done",
                   "topo": _mg(topo_grid),
                   "E":    _mg(E_grid),
@@ -1222,6 +1234,8 @@ def _make_pdf(specs, x_um, y_um, clip_pct, interp, title=None):
             or_ = OUT if phys_aspect >= 1 else max(1, round(OUT * phys_aspect))
             oc_ = OUT if phys_aspect <  1 else max(1, round(OUT / phys_aspect))
             arr = _upsample(arr, or_, oc_)
+            # Clip E (kPa) to non-negative — cubic spline can overshoot
+            if unit in ("kPa", "Pa"): arr = _np.clip(arr, 0.0, None)
             imethod = "bilinear"
         else:
             imethod = "nearest"
@@ -1331,6 +1345,18 @@ async def pf_export(request: "Request"):
     except Exception as e:
         import traceback
         return _safe_json({"error": str(e), "traceback": traceback.format_exc()})
+
+
+@app.get("/api/fv-recompute")
+def fv_recompute(folder: str):
+    """Delete afm_fv_maps.npz so the next expand reprocesses from scratch."""
+    meas = Path(folder)
+    npz  = meas / "afm_fv_maps.npz"
+    deleted = False
+    if npz.exists():
+        try: npz.unlink(); deleted = True
+        except Exception as e: return _safe_json({"ok": False, "error": str(e)})
+    return _safe_json({"ok": True, "deleted": deleted})
 
 
 @app.get("/api/health")
