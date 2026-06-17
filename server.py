@@ -17,6 +17,7 @@ from pydantic import BaseModel
 import json as _json
 import threading
 import multiprocessing
+import time
 import os
 
 def _sanitize(obj):
@@ -67,10 +68,27 @@ from afm_io import (discover_all, update_dataset_meta,
 
 
 # Bump this whenever map computation logic changes — forces all npz to regenerate
-_MAP_CACHE_VERSION = 5
+_MAP_CACHE_VERSION = 9
+
+# Curve oversampling for nearest-neighbour map gridding. Each grid cell takes
+# exactly one nearest sample, so this mainly trades read+fit time for spatial
+# fidelity. 4 = original (smoothest). Lower = faster (2 roughly halves curves
+# read/fit for a barely-visible fidelity change at GRID>=50). Min sensible: 1.
+_E_OVERSAMPLE = 4
+
+# Bump when FV map computation changes — forces afm_fv_maps.npz to regenerate.
+_FV_CACHE_VERSION = 1
 
 _sensor_cache: dict = {}   # folder -> (xs, ys)
 _maps_cache:   dict = {}   # folder -> (result_dict, mtime)
+
+# ── Background pre-processing state ────────────────────────────────────────────
+# A single background job pre-computes afm_maps.npz for every PF folder so that
+# expanding a row is instant. Status is pollable from the UI.
+_prewarm_lock   = threading.Lock()
+_prewarm_state  = {"running": False, "done": 0, "total": 0,
+                   "current": "", "started": 0.0, "finished": 0.0,
+                   "errors": 0}
 
 # LRU TDMS cache — max 3 folders in RAM at once.
 # Each large PF file is 30-90 MB; unlimited caching caused 16 GB+ RAM use.
@@ -100,6 +118,149 @@ def _get_n_samp(meas: "Path") -> int:
             if m: return int(m.group(1))
         except Exception: pass
     return 500
+
+
+def _get_y_size_um(meas: "Path") -> float:
+    """Read Y measurement size (um) from config.txt. Returns 0.0 if absent/NaN —
+    callers use 0.0 as the signal to render a square-aspect map."""
+    import re as _re
+    cfg = Path(meas) / "config.txt"
+    if cfg.exists():
+        try:
+            txt = cfg.read_text(encoding="utf-8", errors="replace")
+            m = _re.search(r"Y.{1,10}?\(.*?m\):\s*([0-9.]+)", txt)
+            if m: return float(m.group(1))
+        except Exception: pass
+    return 0.0
+
+
+def _process_fc(d_raw: "np.ndarray", z_raw: "np.ndarray", meas: "Path"):
+    """Full single-curve processing, validated against glass reference data.
+
+    Returns dict with: z (phase-fit clean Z), d (delay-aligned, baseline-removed
+    deflection), turn, cp, dp (detachment), zunf (unfolded Z).
+
+    Steps (matching afm_drag.py + the glass-slope-match calibration):
+      1. Fit cosine drive model to raw Z  →  clean z_theo (removes sensor noise).
+         turn = argmax(z_theo): Z-max is closest approach (the surface is
+         reached as Z increases in this instrument).
+      2. Find the deflection/Z time lag by matching the post-contact slope of
+         approach and retract (on glass they must be equal). Shift D to align.
+      3. Remove a tilted baseline with a linear polyfit over the pre-contact
+         (off-surface) region → flat zero baseline before contact.
+      4. Contact point = where the rising approach deflection crosses y=0.
+      5. Detachment point = adhesion minimum on the retract.
+    """
+    import numpy as _np
+    n = len(z_raw)
+    try:
+        import re as _re
+        cfg = (meas / "config.txt").read_text(encoding="utf-8", errors="replace")
+        def _f(pat, dflt):
+            m = _re.search(pat, cfg); return float(m.group(1)) if m else dflt
+        ph0 = _f(r"データ取得開始位相:\s*([0-9.]+)", 0.0)
+        ph1 = _f(r"データ取得終了位相:\s*([0-9.]+)", 0.99)
+    except Exception:
+        ph0, ph1 = 0.0, 0.99
+
+    ph = _np.linspace(ph0, ph1, n)
+    G  = _np.column_stack([_np.cos(2*_np.pi*ph), _np.sin(2*_np.pi*ph), _np.ones(n)])
+    try:
+        a, b, c = _np.linalg.lstsq(G, z_raw.astype(_np.float64), rcond=None)[0]
+        A   = float(_np.hypot(a, b)); phi = float(_np.arctan2(-b, a))
+        z_theo = (A*_np.cos(2*_np.pi*ph + phi) + c).astype(_np.float32)
+    except Exception:
+        z_theo = z_raw.astype(_np.float32)
+
+    turn = int(_np.argmax(z_theo))
+    if turn < 5 or turn > n-5:
+        turn = n // 2
+
+    d = d_raw.astype(_np.float64)
+
+    # ── Deflection delay: match approach/retract contact slope (glass) ────────
+    def _slope_gap(delay):
+        if delay <= 0: return 1e9
+        Dd = d[delay:]; Zd = z_theo[:n-delay]
+        tn = int(_np.argmax(Zd))
+        aD, aZ = Dd[:tn], Zd[:tn]; rD, rZ = Dd[tn:], Zd[tn:]
+        thr = 0.3 * float(_np.nanmax(d))
+        ca = aD > thr; cr = rD > thr
+        if ca.sum() < 5 or cr.sum() < 5: return 1e9
+        try:
+            sa = _np.polyfit(aZ[ca], aD[ca], 1)[0]
+            sr = _np.polyfit(rZ[cr], rD[cr], 1)[0]
+            return abs(sa - sr)
+        except Exception:
+            return 1e9
+    best_delay, best_gap = 0, 1e9
+    for dl in range(0, 14):
+        g = _slope_gap(dl)
+        if g < best_gap: best_gap, best_delay = g, dl
+    # Pad the tail so length is preserved
+    if best_delay > 0:
+        d = _np.concatenate([d[best_delay:], _np.full(best_delay, d[-1])])
+
+    # ── Baseline removal: linear polyfit over pre-contact region ──────────────
+    nb = max(10, turn // 3)
+    try:
+        base = _np.polyfit(z_theo[:nb], d[:nb], 1)
+        d_flat = d - _np.polyval(base, z_theo)
+    except Exception:
+        d_flat = d - float(_np.median(d[:nb]))
+
+    # ── Contact point: walk BACK from the deflection peak to the y=0 crossing ─
+    # Searching forward from the start is fragile — a single noise spike near
+    # sample 0 trips the threshold and the CP collapses to the bottom of the
+    # curve (z≈-0.5). Contact is always just before the turnaround, so we start
+    # at the approach deflection maximum and descend until D returns to baseline
+    # (crosses zero). That crossing is the contact point.
+    cp = -1
+    fa = d_flat[:turn]
+    if len(fa) > nb + 3:
+        med = float(_np.median(fa[:nb]))
+        sig = 1.4826 * float(_np.median(_np.abs(fa[:nb] - med))) + 1e-9
+        pk  = int(_np.argmax(fa))
+        # Require a real contact (peak well above baseline noise)
+        if fa[pk] > med + 8.0 * sig and pk > 3:
+            j = pk
+            while j > 0 and fa[j] > med:
+                j -= 1
+            cp = j
+
+    # ── Detachment point: adhesion minimum on retract ─────────────────────────
+    dp = -1
+    if turn < n - 2:
+        dp = turn + int(_np.argmin(d_flat[turn:]))
+
+    # ── Unfolded Z (cumulative |dz|, turnaround = 1.0) ────────────────────────
+    zunf = _np.concatenate([[0.0], _np.cumsum(_np.abs(_np.diff(z_theo)))])
+    norm = zunf[turn] if zunf[turn] > 0 else 1.0
+    zunf = (zunf / norm).astype(_np.float32)
+
+    return {"z": z_theo, "d": d_flat.astype(_np.float32), "zunf": zunf,
+            "turn": turn, "cp": cp, "dp": dp, "delay": best_delay}
+
+
+def _phase_correct_z(z_raw: "np.ndarray", meas: "Path"):
+    """Legacy wrapper — returns (z_theo, turn=argmax). Kept for compatibility."""
+    import numpy as _np
+    n = len(z_raw)
+    try:
+        import re as _re
+        cfg = (meas / "config.txt").read_text(encoding="utf-8", errors="replace")
+        def _f(pat, dflt):
+            m = _re.search(pat, cfg); return float(m.group(1)) if m else dflt
+        ph0 = _f(r"データ取得開始位相:\s*([0-9.]+)", 0.0)
+        ph1 = _f(r"データ取得終了位相:\s*([0-9.]+)", 0.99)
+        ph = _np.linspace(ph0, ph1, n)
+        G  = _np.column_stack([_np.cos(2*_np.pi*ph), _np.sin(2*_np.pi*ph), _np.ones(n)])
+        a, b, c = _np.linalg.lstsq(G, z_raw.astype(_np.float64), rcond=None)[0]
+        A = float(_np.hypot(a, b)); phi = float(_np.arctan2(-b, a))
+        z_theo = (A*_np.cos(2*_np.pi*ph + phi) + c).astype(_np.float32)
+        return z_theo, int(_np.argmax(z_theo))
+    except Exception:
+        return z_raw, len(z_raw) // 2
 
 
 def _load_tdms_arrays(meas: Path):
@@ -199,7 +360,7 @@ def _compute_and_cache_maps(meas) -> bool:
     # Row-uniform curve selection — guarantees all rows are represented
     # (uniform stride leaves last N rows unsampled → edge artifacts)
     n_rows_g = max(1, n_pts // nx)
-    n_per_row = max(1, (GRID * GRID * 4) // n_rows_g)
+    n_per_row = max(1, (GRID * GRID * _E_OVERSAMPLE) // n_rows_g)
     sel_list = []
     for _r in range(n_rows_g):
         _rs = _r * nx; _re = _rs + nx
@@ -619,6 +780,90 @@ def scan_stream():
                              headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 
+@app.post("/api/prewarm")
+def prewarm_start(force: bool = False):
+    """Kick off background pre-computation of all PF map caches (afm_maps.npz).
+
+    Non-blocking: returns immediately. Poll /api/prewarm-status for progress.
+    Folders whose cache is already fresh are skipped (instant), unless force=1.
+    Uses a process pool so each TDMS read/E-fit runs off the main event loop.
+    """
+    with _prewarm_lock:
+        if _prewarm_state["running"]:
+            return _safe_json({"ok": True, "already_running": True,
+                               **_prewarm_state})
+        if not _current_root:
+            return _safe_json({"ok": False, "error": "no_root"})
+
+        try:
+            datasets = discover_all(Path(_current_root))
+        except Exception as e:
+            return _safe_json({"ok": False, "error": str(e)})
+
+        folders = []
+        for d in datasets:
+            if d.get("mode") != "PF":
+                continue
+            f = Path(d["folder"])
+            tdms = f / "ForceCurve.tdms"
+            if not tdms.exists():
+                continue
+            if not force:
+                npz = f / "afm_maps.npz"
+                # Skip if cache is newer than the TDMS (fresh)
+                if npz.exists() and npz.stat().st_mtime >= tdms.stat().st_mtime:
+                    continue
+            folders.append(str(f))
+
+        _prewarm_state.update(running=True, done=0, total=len(folders),
+                              current="", started=time.time(), finished=0.0,
+                              errors=0)
+
+    if not folders:
+        with _prewarm_lock:
+            _prewarm_state.update(running=False, finished=time.time())
+        return _safe_json({"ok": True, "total": 0, "note": "all caches fresh"})
+
+    def _runner(folder_list):
+        ctx = multiprocessing.get_context("spawn")
+        n_cores = max(1, round((os.cpu_count() or 1) * 0.8))
+        try:
+            with ctx.Pool(processes=n_cores) as pool:
+                for folder_str, result in pool.imap_unordered(
+                        _workers.stage_worker, folder_list, chunksize=1):
+                    with _prewarm_lock:
+                        _prewarm_state["done"] += 1
+                        _prewarm_state["current"] = Path(folder_str).name
+                        if not result:
+                            _prewarm_state["errors"] += 1
+        except Exception:
+            with _prewarm_lock:
+                _prewarm_state["errors"] += 1
+        finally:
+            with _prewarm_lock:
+                _prewarm_state["running"] = False
+                _prewarm_state["finished"] = time.time()
+                _prewarm_state["current"] = ""
+
+    threading.Thread(target=_runner, args=(folders,), daemon=True).start()
+    return _safe_json({"ok": True, "total": len(folders)})
+
+
+@app.get("/api/prewarm-status")
+def prewarm_status():
+    with _prewarm_lock:
+        s = dict(_prewarm_state)
+    if s["total"]:
+        s["pct"] = round(s["done"] / s["total"] * 100)
+    else:
+        s["pct"] = 100
+    if s["started"] and s["finished"]:
+        s["elapsed"] = round(s["finished"] - s["started"], 1)
+    elif s["started"]:
+        s["elapsed"] = round(time.time() - s["started"], 1)
+    return _safe_json(s)
+
+
 @app.get("/api/scan-debug")
 def scan_debug():
     """Detailed scan diagnostics - open in browser to see exactly what fails."""
@@ -751,20 +996,50 @@ def get_maps(folder: str):
                 npz = _np2.load(str(_npz))
                 if int(npz.get("_version", _np2.array([0]))[0]) != _MAP_CACHE_VERSION:
                     raise ValueError("stale")
+                # Defensive: a PF folder (has TDMS) must have an E map. If a cache
+                # was written without it (e.g. by an older/partial writer), treat
+                # it as stale and fall through to recompute rather than silently
+                # serving a result with no E panel.
+                if _tdms2.exists() and "e" not in npz.files:
+                    raise ValueError("missing E map")
+                # Invalidate if INVOLS changed since this E map was computed —
+                # the user can edit INVOLS per-measurement and expects E to follow.
+                if _tdms2.exists():
+                    try:
+                        from afm_io import resolve_invols as _ri, load_comments as _lc
+                        _cm = _lc(meas)
+                        _want = round(_ri(_cm, _cm.get("cantilever")) / 1000.0, 6)
+                        _have = round(float(npz["e_invols"][0]), 6) if "e_invols" in npz.files else None
+                        if _have is None or abs(_have - _want) > 1e-9:
+                            raise ValueError("INVOLS changed")
+                    except ValueError:
+                        raise
+                    except Exception:
+                        pass
                 GRID2 = int(npz["grid_n"][0])
                 def _nm(arr):
                     flat=[round(float(v),4) for v in arr.ravel()]
                     return {"data":flat,"rows":GRID2,"cols":GRID2,"n":len(flat),
                             "vmin":round(float(_np2.nanmin(arr)),4),
                             "vmax":round(float(_np2.nanmax(arr)),4)}
-                if "cp"   in npz.files: result["maps"]["CP"]             = _nm(npz["cp"])
-                if "zpid" in npz.files: result["maps"]["ZSamplePID.txt"] = _nm(npz["zpid"])
-                if "ztip" in npz.files: result["maps"]["ZTipoffsets.txt"]= _nm(npz["ztip"])
-                if "e"    in npz.files: result["maps"]["E"]              = _nm((npz["e"]/1000.0).astype(_np2.float32))
+                if "topo" in npz.files:
+                    result["maps"]["Topo"] = _nm(npz["topo"])
+                elif "cp" in npz.files:
+                    # Legacy cache (pre-v7): compute topo on the fly
+                    _cp_g = npz["cp"]
+                    _topo = (_cp_g + npz["ztip"]) if "ztip" in npz.files else _cp_g.copy()
+                    _med  = float(_np2.nanmedian(_topo))
+                    if _np2.isfinite(_med): _topo -= _med
+                    result["maps"]["Topo"] = _nm(_topo.astype(_np2.float32))
+                if "zpid" in npz.files:
+                    result["maps"]["ZSamplePID"] = _nm(npz["zpid"])
+                if "e" in npz.files:
+                    result["maps"]["E"]    = _nm((npz["e"]/1000.0).astype(_np2.float32))
                 result["n_curves"] = len(npz["x_raw"])
                 result["x_coords"] = [round(float(v),4) for v in npz["xi"].tolist()]
                 result["y_coords"] = [round(float(v),4) for v in npz["yi"].tolist()]
                 result["grid_n"]   = GRID2
+                result["y_size_um"] = _get_y_size_um(meas)
                 if "grid_to_fc" in npz.files:
                     result["grid_to_fc"] = npz["grid_to_fc"].tolist()
                 _maps_cache[_map_key] = (result, _map_mtime)
@@ -806,7 +1081,7 @@ def get_maps(folder: str):
         # Row-uniform curve selection — guarantees all rows are represented
         # (uniform stride leaves last N rows unsampled → edge artifacts)
         _n_rows_g = max(1, n_pts // _nx)
-        _n_per_row = max(1, (GRID * GRID * 4) // _n_rows_g)
+        _n_per_row = max(1, (GRID * GRID * _E_OVERSAMPLE) // _n_rows_g)
         _sel_list = []
         for _r in range(_n_rows_g):
             _rs = _r * _nx; _re = _rs + _nx
@@ -829,7 +1104,17 @@ def get_maps(folder: str):
 
         cp_sel = _np.empty(n_sel, dtype=_np.float32)
         E_sel  = _np.full(n_sel, _np.nan, dtype=_np.float32)
-        _k=0.2; _nu=0.5; _alpha_r=_np.radians(17.5); _INVOLS=0.1686
+        # E-fit constants: INVOLS + k come from the (overridable) sidecar /
+        # cantilever; nu/alpha are tip-geometry constants.
+        _nu=0.5; _alpha_r=_np.radians(17.5)
+        try:
+            from afm_io import resolve_invols as _ri, get_cantilever_defaults as _gcd, load_comments as _lc
+            _cm   = _lc(meas)
+            _cant = _cm.get("cantilever")
+            _INVOLS = _ri(_cm, _cant) / 1000.0   # nm/V -> um/V
+            _k      = float(_gcd(_cant).get("k", 0.2))
+        except Exception:
+            _k = 0.2; _INVOLS = 0.1686
 
         try:
             from nptdms import TdmsFile as _TF
@@ -853,13 +1138,14 @@ def get_maps(folder: str):
                     _delta=(_Zc-_Dc)*1e-6; _F=_Dc*_k*1e-6
                     _fm=int(_np.argmax(_F))
                     if _fm>=3:
-                        _d2=_delta[:_fm]**2; _mk=_d2>0
+                        _x=_delta[:_fm]**2; _y=_F[:_fm]; _mk=_x>0
                         if _mk.sum()>=3:
-                            try:
-                                _sl,_=_np.polyfit(_d2[_mk],_F[:_fm][_mk],1)
-                                _Ev=float(_sl*_math.pi*(1-_nu**2)/(2*_math.tan(_alpha_r)))
+                            _x=_x[_mk]; _y=_y[_mk]
+                            _dx=_x-_x.mean(); _den=float(_dx@_dx)
+                            if _den>0:
+                                _sl=float(_dx@(_y-_y.mean()))/_den
+                                _Ev=_sl*_math.pi*(1-_nu**2)/(2*_math.tan(_alpha_r))
                                 if _Ev>0: E_sel[_oi]=_Ev
-                            except Exception: pass
 
                 if (_oi+1) % REPORT_EVERY == 0 or _oi == n_sel-1:
                     pct = 10 + round((_oi+1)/n_sel * 70)
@@ -887,6 +1173,7 @@ def get_maps(folder: str):
                       xi=xi.astype(_np.float32), yi=yi.astype(_np.float32),
                       x_raw=xs, y_raw=ys, grid_to_fc=g2f,
                       grid_n=_np.array([GRID], dtype=_np.int32),
+                      e_invols=_np.array([_INVOLS], dtype=_np.float32),
                       _version=_np.array([_MAP_CACHE_VERSION], dtype=_np.int32))
 
         for fname, key in [("ZSamplePID.txt","zpid"), ("ZTipoffsets.txt","ztip")]:
@@ -911,14 +1198,26 @@ def get_maps(folder: str):
             return {"data":flat,"rows":GRID,"cols":GRID,"n":len(flat),
                     "vmin":round(float(_np.nanmin(arr)),4),
                     "vmax":round(float(_np.nanmax(arr)),4)}
-        result["maps"]["CP"]             = _nm3(cp_grid)
-        result["maps"]["E"]              = _nm3(E_grid/1000.0)
-        if "zpid" in arrays: result["maps"]["ZSamplePID.txt"] = _nm3(arrays["zpid"])
-        if "ztip" in arrays: result["maps"]["ZTipoffsets.txt"]= _nm3(arrays["ztip"])
+        # Topo = ZTipoffsets (slow PID Z) + CP (fine contact height), median-subtracted.
+        # Matches afm_drag.py fig_topomap: topo = offset + cp_h.
+        _ztip = arrays.get("ztip")
+        _topo = (_ztip + cp_grid) if _ztip is not None else cp_grid.copy()
+        _med  = float(_np.nanmedian(_topo[_np.isfinite(_topo)]))
+        if _np.isfinite(_med): _topo -= _med
+        arrays["topo"] = _topo.astype(_np.float32)
+        # Drop the individual components — they're absorbed into topo
+        arrays.pop("cp",   None)
+        arrays.pop("ztip", None)
+        # zpid (ZSamplePID) stays in arrays — saved to cache and shown as its own map
+
+        result["maps"]["Topo"] = _nm3(_topo)
+        if "zpid" in arrays: result["maps"]["ZSamplePID"] = _nm3(arrays["zpid"])
+        result["maps"]["E"]    = _nm3(E_grid/1000.0)
         result["n_curves"]  = n_pts
         result["x_coords"]  = [round(float(v),4) for v in xi.tolist()]
         result["y_coords"]  = [round(float(v),4) for v in yi.tolist()]
         result["grid_n"]    = GRID
+        result["y_size_um"] = _get_y_size_um(meas)
         result["grid_to_fc"]= g2f.tolist()
 
         if result.get("maps"):
@@ -982,9 +1281,19 @@ def get_fc(folder: str, index: int = 0):
         except Exception:
             pass
 
-        return _safe_json({"index": idx, "z": z, "d": d, "zs": zs,
-                           "n": len(d), "n_curves": n_curves,
-                           "x_pos": x_pos, "y_pos": y_pos})
+        # Full processing: phase-fit Z, delay-align D, baseline removal,
+        # CP at y=0 crossing, detachment point, unfolded Z. Validated on glass.
+        _z_raw = _np.array([v if v is not None else 0.0 for v in z], dtype=_np.float64)
+        _d_raw = _np.array([v if v is not None else 0.0 for v in d], dtype=_np.float64)
+        _r = _process_fc(_d_raw, _z_raw, meas)
+
+        return _safe_json({"index": idx, "n": _r["turn"], "n_curves": n_curves,
+                           "z":    clean(_r["z"]),
+                           "d":    clean(_r["d"]),
+                           "zunf": clean(_r["zunf"]),
+                           "zs":   zs,
+                           "x_pos": x_pos, "y_pos": y_pos,
+                           "turn": _r["turn"], "cp": _r["cp"], "dp": _r["dp"]})
     except HTTPException:
         raise
     except Exception as e:
@@ -1051,13 +1360,55 @@ def fv_maps_stream(folder: str):
         # ── Cantilever params from comments sidecar ───────────────────────────
         INVOLS = 0.1686; StIV = 30.0; k = 0.09; nu = 0.5; alpha = 17.5
         try:
-            from afm_io import load_comments as _lc
+            from afm_io import (load_comments as _lc,
+                                resolve_invols as _ri,
+                                get_cantilever_defaults as _gcd)
             comments = _lc(meas)
-            cant = comments.get("cantilever","AC40")
-            from io_utils_PF import get_cantilever_defaults as _gcd
-            cd = _gcd(cant)
-            INVOLS = cd["invols"] / 1000.0   # nm→um
-            k      = cd["k"]
+            cant = comments.get("cantilever") or "AC40"
+            INVOLS = _ri(comments, cant) / 1000.0   # nm/V -> um/V (honours override)
+            cd     = _gcd(cant)
+            k      = cd.get("k", k)
+            nu     = cd.get("nu", nu)
+            alpha  = cd.get("alpha", alpha)
+        except Exception:
+            pass
+
+        # ── Fast path: serve a fresh cache instead of reprocessing ────────────
+        # The old code reprocessed every LVM on every expand. Now, if a cached
+        # afm_fv_maps.npz is newer than all source files, matches the cache
+        # version, and was computed with the current INVOLS, emit it instantly.
+        _npz_fv = meas / "afm_fv_maps.npz"
+        try:
+            _src_mtime = max([p.stat().st_mtime for p in lvm_files] +
+                             [cfg_path.stat().st_mtime if cfg_path.exists() else 0])
+            if _npz_fv.exists() and _npz_fv.stat().st_mtime >= _src_mtime:
+                _v = _np.load(str(_npz_fv))
+                _ver_ok = int(_v.get("_version", _np.array([0]))[0]) == _FV_CACHE_VERSION
+                _inv_c  = float(_v["e_invols"][0]) if "e_invols" in _v.files else None
+                if _ver_ok and _inv_c is not None and abs(_inv_c - INVOLS) < 1e-9:
+                    _tg = _v["topo"]; _eg = _v["E"]
+                    _gr = _v["grid"]; _rc, _cc = int(_gr[0]), int(_gr[1])
+                    _xi = _v["xi"]; _yi = _v["yi"]; _xr = _v["x_raw"]; _yr = _v["y_raw"]
+                    _part = bool(_v["partial"][0]) if "partial" in _v.files else False
+                    def _mgc(grid):
+                        flat = grid.ravel().tolist()
+                        vld = [x for x in flat if x is not None and _math.isfinite(float(x))]
+                        return {"data":[round(float(x),4) if _math.isfinite(float(x)) else None
+                                        for x in flat],
+                                "rows":_rc,"cols":_cc,
+                                "vmin":round(min(vld),4) if vld else 0,
+                                "vmax":round(max(vld),4) if vld else 1}
+                    yield ev({"type":"progress","done":n_files,"total":n_files,
+                              "label":"Loaded from cache \u2713"})
+                    yield ev({"type":"done",
+                              "topo": _mgc(_tg), "E": _mgc(_eg), "grid":[_rc,_cc],
+                              "x_raw":[round(float(x),3) for x in _xr],
+                              "y_raw":[round(float(x),3) for x in _yr],
+                              "x_coords":[round(float(x),3) for x in _xi],
+                              "y_coords":[round(float(x),3) for x in _yi],
+                              "grid_n":_cc, "partial":_part,
+                              "x_um":xlength, "y_um":ylength})
+                    return
         except Exception:
             pass
 
@@ -1071,13 +1422,14 @@ def fv_maps_stream(folder: str):
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=n_cores) as pool:
             for res in pool.imap_unordered(_workers.fv_worker, args_list, chunksize=4):
-                idx, zm, ds, cp, E_val = res
+                idx, zm, ds, cp, E_val = res[0], res[1], res[2], res[3], res[4]
                 results[idx] = (zm, ds, cp, E_val)
                 done += 1
                 yield ev({"type":"progress","done":done,"total":n_files,
                           "label":f"{lvm_files[idx].name}"})
 
         # ── Build maps ────────────────────────────────────────────────────────
+        # topo from contact-point Z height; E from Sneddon fit.
         topo = _np.array([r[0][r[2]] if r and len(r[0]) > r[2] else _np.nan
                           for r in results], dtype=_np.float32)
         E_arr = _np.array([r[3] if r else _np.nan for r in results], dtype=_np.float32)
@@ -1139,7 +1491,10 @@ def fv_maps_stream(folder: str):
                 x_raw=xs.astype(_np.float32), y_raw=ys.astype(_np.float32),
                 xlength=_np.array([xlength], dtype=_np.float32),
                 ylength=_np.array([ylength], dtype=_np.float32),
-                grid=_np.array([rows, cols], dtype=_np.int32))
+                grid=_np.array([rows, cols], dtype=_np.int32),
+                partial=_np.array([0 if is_complete else 1], dtype=_np.int32),
+                e_invols=_np.array([INVOLS], dtype=_np.float32),
+                _version=_np.array([_FV_CACHE_VERSION], dtype=_np.int32))
         except Exception: pass
 
         yield ev({"type":"done",
@@ -1174,18 +1529,42 @@ def get_fv_fc(folder: str, index: int = 0):
 
     idx = max(0, min(index, len(lvm_files)-1))
     INVOLS = 0.1686; StIV = 30.0; k = 0.09; nu = 0.5; alpha = 17.5
+    try:
+        from afm_io import (load_comments as _lc,
+                            resolve_invols as _ri,
+                            get_cantilever_defaults as _gcd)
+        _cm   = _lc(meas)
+        _cant = _cm.get("cantilever") or "AC40"
+        INVOLS = _ri(_cm, _cant) / 1000.0
+        _cd   = _gcd(_cant)
+        k = _cd.get("k", k); nu = _cd.get("nu", nu); alpha = _cd.get("alpha", alpha)
+    except Exception:
+        pass
 
     res = _workers.fv_worker((str(lvm_files[idx]), idx, INVOLS, StIV, k, 8, 3, 10, nu, alpha))
-    _, zm, ds, cp, E_val = res
-    nx = len(lvm_files)
+    idx_r, zm, ds, cp, E_val = res[0], res[1], res[2], res[3], res[4]
+    turn = int(res[5]) if len(res) > 5 else len(zm) - 1
+    dp   = int(res[6]) if len(res) > 6 else -1
 
     def _c(arr):
         return [None if _math.isnan(float(v)) or _math.isinf(float(v))
                 else round(float(v),5) for v in arr]
 
+    # Full curve (approach+retract). Unfolded Z = cumulative |dz| normalised so
+    # the turnaround = 1.0 (approach 0..1, retract 1..2), like the PF view.
+    import numpy as _np
+    _zm = _np.asarray(zm, dtype=_np.float64)
+    if len(_zm) > 1 and 0 < turn < len(_zm):
+        _zunf = _np.concatenate([[0.0], _np.cumsum(_np.abs(_np.diff(_zm)))])
+        _norm = _zunf[turn] if _zunf[turn] > 0 else 1.0
+        _zunf = _zunf / _norm
+    else:
+        _zunf = _np.zeros(len(_zm))
+
     return _safe_json({
         "index": idx, "n_curves": len(lvm_files),
         "z": _c(zm), "d": _c(ds), "cp": int(cp),
+        "zunf": _c(_zunf), "turn": turn, "dp": dp,
         "E": None if _math.isnan(E_val) else round(E_val, 2)
     })
 
@@ -1316,7 +1695,7 @@ async def fv_export(request: "Request"):
 
 @app.post("/api/pf-export")
 async def pf_export(request: "Request"):
-    """Paper-ready PDF of PF maps (ZSamplePID, ZTipoffsets, CP, E)."""
+    """Paper-ready PDF of PF maps (Topo, E)."""
     import math as _m, numpy as _np
     body = await request.json()
     maps_data   = body.get("maps", {})
@@ -1325,11 +1704,9 @@ async def pf_export(request: "Request"):
     clip_pct    = float(body.get("clip_pct", 5))
     interp      = bool(body.get("interpolate", False))
     try:
-        cmaps = ["viridis", "plasma", "inferno", "magma", "cividis"]
-        units = {"ZSamplePID.txt":"V","ZTipoffsets.txt":"V","CP":"V","E":"kPa"}
-        # Fixed colormaps by map name
-        cmap_for = {"ZSamplePID.txt":"viridis","ZTipoffsets.txt":"plasma",
-                    "CP":"cividis","E":"inferno"}
+        cmaps = ["cividis", "inferno", "viridis", "plasma", "magma"]
+        units    = {"Topo":"V", "ZSamplePID":"V", "E":"kPa"}
+        cmap_for = {"Topo":"cividis", "ZSamplePID":"viridis", "E":"inferno"}
         specs = []
         for i, (nm, md) in enumerate(maps_data.items()):
             a = _np.array(

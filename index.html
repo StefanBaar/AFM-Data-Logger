@@ -448,47 +448,53 @@ function fmtCb(v){
 // This prevents approach/retract overlapping on the x-axis (which happens
 // with raw folded Z because both span the same Zmin..Zmax range).
 // ── E vs x-velocity for one scan line ───────────────────────────────────────
-// For a selected Y row, scatter E (y-axis) against |x-velocity| (x-axis) for
-// each grid cell in that row. x-velocity = |d(x_position)/d(curve index)| from
-// the raw sensor positions, looked up per cell via grid_to_fc.
-function drawEVel(canvas, eMap, gridToFC, GRID, row, velByCurve){
+// Tests whether cantilever drag correlates with tip speed (usually it doesn't).
+// x-velocity comes from the KNOWN sinusoidal fast-axis drive: the tip sweeps
+// x = sin(phase) across the line, so speed = |cos(phase)| — high at the line
+// edges, ~0 at the centre. This is deterministic per column and therefore the
+// SAME for every line, giving a fixed, comparable x-axis. The E (y) range is
+// fixed globally (across the whole map) so flipping through Y lines is directly
+// comparable. velCol and [emin,emax] are precomputed once and passed in.
+function drawEVel(canvas, eMap, GRID, row, velCol, emin, emax){
   var W=canvas.width, H=canvas.height, ctx=canvas.getContext('2d');
   ctx.clearRect(0,0,W,H);
   if(!eMap||!eMap.data) return;
   var pts=[];
   for(var col=0;col<GRID;col++){
-    var cell=row*GRID+col;
-    var e=eMap.data[cell];
+    var e=eMap.data[row*GRID+col];
     if(e==null||!isFinite(e)) continue;
-    var fc=(gridToFC&&gridToFC.length>cell)?gridToFC[cell]:-1;
-    var v=(fc>=0&&velByCurve&&fc<velByCurve.length)?velByCurve[fc]:col;
-    pts.push([v,e]);
+    pts.push([velCol[col], e]);
   }
-  if(pts.length<2){ ctx.fillStyle='rgba(150,150,170,0.5)';ctx.font='10px monospace';
-    ctx.textAlign='center';ctx.fillText('no data in line',W/2,H/2); return; }
-  var vmin=Infinity,vmax=-Infinity,emin=Infinity,emax=-Infinity;
-  pts.forEach(function(p){if(p[0]<vmin)vmin=p[0];if(p[0]>vmax)vmax=p[0];
-    if(p[1]<emin)emin=p[1];if(p[1]>emax)emax=p[1];});
-  var vs=vmax-vmin||1, es=emax-emin||1, pad=30;
-  function tx(v){return pad+(v-vmin)/vs*(W-pad-8);}
-  function ty(v){return H-pad-(v-emin)/es*(H-pad-8);}
+  var pad=34, vmin=0, vmax=1;            // velocity normalised 0..1 (fixed)
+  var es=(emax-emin)||1;
+  function tx(v){return pad+(v-vmin)/(vmax-vmin)*(W-pad-10);}
+  function ty(v){return H-pad-(v-emin)/es*(H-pad-10);}
+  // axes
   ctx.strokeStyle='rgba(255,255,255,0.15)'; ctx.lineWidth=1; ctx.setLineDash([]);
-  ctx.beginPath();ctx.moveTo(pad,8);ctx.lineTo(pad,H-pad);ctx.lineTo(W-4,H-pad);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(pad,8);ctx.lineTo(pad,H-pad);ctx.lineTo(W-6,H-pad);ctx.stroke();
   ctx.strokeStyle='rgba(255,255,255,0.06)';
   for(var g=1;g<=3;g++){var gy=8+g*(H-pad-8)/4;
-    ctx.beginPath();ctx.moveTo(pad,gy);ctx.lineTo(W-4,gy);ctx.stroke();}
+    ctx.beginPath();ctx.moveTo(pad,gy);ctx.lineTo(W-6,gy);ctx.stroke();}
+  for(var g=1;g<=4;g++){var gx=pad+g*(W-pad-10)/4;
+    ctx.beginPath();ctx.moveTo(gx,8);ctx.lineTo(gx,H-pad);ctx.stroke();}
+  if(pts.length<2){ ctx.fillStyle='rgba(150,150,170,0.5)';ctx.font='10px monospace';
+    ctx.textAlign='center';ctx.fillText('no E data in line',W/2,H/2); return; }
+  // sort by velocity, faint trend line + points
   pts.sort(function(a,b){return a[0]-b[0];});
-  ctx.strokeStyle='rgba(255,160,40,0.35)'; ctx.lineWidth=1; ctx.beginPath();
-  pts.forEach(function(p,i){var x=tx(p[0]),y=ty(p[1]);
-    i?ctx.lineTo(x,y):ctx.moveTo(x,y);}); ctx.stroke();
+  ctx.strokeStyle='rgba(255,160,40,0.30)'; ctx.lineWidth=1; ctx.beginPath();
+  pts.forEach(function(p,i){var x=tx(p[0]),y=ty(p[1]);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+  ctx.stroke();
   ctx.fillStyle='rgba(255,190,70,0.95)';
-  pts.forEach(function(p){ctx.beginPath();ctx.arc(tx(p[0]),ty(p[1]),2.2,0,6.28);ctx.fill();});
+  pts.forEach(function(p){ctx.beginPath();ctx.arc(tx(p[0]),ty(Math.max(emin,Math.min(emax,p[1]))),2.2,0,6.28);ctx.fill();});
+  // labels
   ctx.fillStyle='rgba(106,116,148,0.85)'; ctx.font='9px monospace';
-  ctx.textAlign='center'; ctx.fillText('x-velocity',W/2,H-3);
-  ctx.save();ctx.translate(9,H/2);ctx.rotate(-Math.PI/2);ctx.fillText('E',0,0);ctx.restore();
+  ctx.textAlign='center'; ctx.fillText('x-velocity (low \u2192 high)',W/2,H-3);
+  ctx.save();ctx.translate(10,H/2);ctx.rotate(-Math.PI/2);ctx.fillText('E',0,0);ctx.restore();
   ctx.textAlign='right'; ctx.fillStyle='rgba(150,160,190,0.7)';
   ctx.fillText(emax.toPrecision(3),pad-2,12);
   ctx.fillText(emin.toPrecision(3),pad-2,H-pad);
+  ctx.textAlign='left'; ctx.fillText('0',pad,H-pad+10);
+  ctx.textAlign='right'; ctx.fillText('1',W-6,H-pad+10);
 }
 
 function drawFC(canvas, z, d, turn, cp, zunf, dp){
@@ -904,7 +910,7 @@ function loadFVMaps(panel, d, _partialBadgeWrap){
           .then(function(t){return JSON.parse(t);})
           .then(function(b){
             // FV worker returns approach-only curve: turn=end, no detachment.
-            if(_fcCv) drawFC(_fcCv,b.z,b.d,b.turn,b.cp,b.zunf,-1);
+            if(_fcCv) drawFC(_fcCv,b.z,b.d,b.turn,b.cp,b.zunf,b.dp);
             if(_slider) _slider.max=Math.max(0,b.n_curves-1);
             if(_idxLbl) _idxLbl.textContent=b.index+' / '+(b.n_curves-1);
             var eStr=b.E!=null?'  E='+(b.E/1000).toFixed(1)+'kPa':'';
@@ -1322,11 +1328,20 @@ function loadMaps(panel, d){
       // ── E vs x-velocity per scan line ──────────────────────────────────────
       var eMapData = pfMapsRaw['E'];   // raw E map (kPa)
       if(eMapData && GRID>1){
-        // x-velocity per curve = |gradient of x sensor position|
-        var velByCurve=new Array(xRaw.length).fill(0);
-        for(var i=0;i<xRaw.length;i++){
-          var a=xRaw[Math.max(0,i-1)], b=xRaw[Math.min(xRaw.length-1,i+1)];
-          velByCurve[i]=Math.abs((b-a)/2);
+        // x-velocity from the KNOWN sinusoidal fast-axis drive: tip position
+        // x = sin(phase) across the line, speed = |cos(phase)|. Deterministic
+        // per column → identical x-axis for every line. (The X-sensor gradient
+        // is pure noise on small scans, so we use the drive model instead.)
+        var velCol=new Array(GRID);
+        for(var c=0;c<GRID;c++){ velCol[c]=Math.abs(Math.cos(c/(GRID-1)*Math.PI)); }
+        // Global E range across the WHOLE map so all lines share the same y-axis.
+        function eGlobalRange(em){
+          var lo=Infinity,hi=-Infinity;
+          for(var i=0;i<em.data.length;i++){var v=em.data[i];
+            if(v!=null&&isFinite(v)){if(v<lo)lo=v;if(v>hi)hi=v;}}
+          if(!isFinite(lo)){lo=0;hi=1;}
+          // 2% padding
+          var p=(hi-lo)*0.02||0.01; return [lo-p,hi+p];
         }
         var evWrap=document.createElement('div'); evWrap.className='xmap';
         var evTtl=document.createElement('div'); evTtl.className='xmap-title';
@@ -1345,10 +1360,10 @@ function loadMaps(panel, d){
         function evYval(r){ return (yCoords&&yCoords.length>r)?yCoords[r].toFixed(2):r; }
         evLbl.textContent='y='+evYval(evRow0);
         function evRender(r){
-          // use the same processing (despike) the E map shows
           var eRaw=pfMapsRaw['E'];
           var eProc=pfDespike?despikeMap(eRaw,4):eRaw;
-          drawEVel(evCv, eProc, gridToFC, GRID, r, velByCurve);
+          var rng=eGlobalRange(eProc);     // fixed across all lines
+          drawEVel(evCv, eProc, GRID, r, velCol, rng[0], rng[1]);
           evLbl.textContent='y='+evYval(r);
         }
         evSlider.addEventListener('input',function(){ evRender(parseInt(evSlider.value)); });
@@ -1356,7 +1371,6 @@ function loadMaps(panel, d){
         evWrap.appendChild(evRow);
         panel.insertBefore(evWrap, pb);
         evRender(evRow0);
-        // re-render E-velocity when despike/robust/clip changes E
         pfEVelRerender=function(){ evRender(parseInt(evSlider.value)); };
       }
 

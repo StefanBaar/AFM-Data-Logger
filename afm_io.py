@@ -58,6 +58,25 @@ def get_cantilever_defaults(name: str) -> dict:
     return CANTILEVER_DEFAULTS["AC40"].copy()
 
 
+def resolve_invols(comments: dict, cantilever: Optional[str]) -> float:
+    """Effective INVOLS (nm/V) for the E computation.
+
+    Priority:
+      1. Manual per-measurement override in the sidecar ("invols")
+      2. Cantilever default (CANTILEVER_DEFAULTS)
+    Returns a float in nm/V. Callers that need um/V divide by 1000.
+    """
+    try:
+        v = comments.get("invols")
+        if v is not None and str(v).strip() != "":
+            f = float(v)
+            if f > 0:
+                return f
+    except Exception:
+        pass
+    return float(get_cantilever_defaults(cantilever).get("invols", 140.0))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Comments sidecar  (.afm_comments.json next to config.txt)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,6 +554,8 @@ def discover_pf_datasets(root: Path) -> list[dict]:
             "time":        path_info["time"],
             "meas_id":     path_info["meas_id"],
             "cantilever":  comments.get("cantilever") or cfg_data.get("cantilever"),
+            "invols":      resolve_invols(comments, comments.get("cantilever") or cfg_data.get("cantilever")),
+            "invols_override": comments.get("invols") not in (None, ""),
             "frequency_hz": cfg_data["frequency_hz"],
             "n_samples":   cfg_data["n_samples"],
             "x_length":    cfg_data["x_length"],
@@ -605,6 +626,8 @@ def discover_fv_datasets(root: Path) -> list[dict]:
             "sample_name": comments.get("sample_name") or path_info["sample_name"],
             "sample_name_original": path_info["sample_name"],
             "cantilever":  comments.get("cantilever") or cfg_data.get("cantilever"),
+            "invols":      resolve_invols(comments, comments.get("cantilever") or cfg_data.get("cantilever")),
+            "invols_override": comments.get("invols") not in (None, ""),
             "u_trigger":   cfg_data["u_trigger"],
             "app_speed":   cfg_data["app_speed"],
             "ret_speed":   cfg_data["ret_speed"],
@@ -662,6 +685,12 @@ def update_dataset_meta(folder: str, mode: str, updates: dict) -> dict:
         comments["comments"] = updates["comments"]
     if "cantilever" in updates:
         comments["cantilever"] = updates["cantilever"]
+    if "invols" in updates:
+        v = str(updates["invols"]).strip()
+        if v == "":
+            comments.pop("invols", None)   # empty -> revert to cantilever default
+        else:
+            comments["invols"] = v
 
     new_folder = folder_path  # may be reassigned below
 
@@ -692,7 +721,13 @@ def update_dataset_meta(folder: str, mode: str, updates: dict) -> dict:
     cfg_data = parse_pf_config(new_folder / "config.txt") if mode == "PF" else parse_fv_config(new_folder / "config.txt")
     now_filled = _dataset_is_filled(cfg_data, comments)
 
-    return {"ok": True, "new_folder": str(new_folder), "now_filled": now_filled}
+    # Resolved INVOLS (so the UI can reflect override -> default transitions)
+    _cant = comments.get("cantilever") or cfg_data.get("cantilever")
+    inv_resolved = resolve_invols(comments, _cant)
+
+    return {"ok": True, "new_folder": str(new_folder), "now_filled": now_filled,
+            "invols": inv_resolved,
+            "invols_override": comments.get("invols") not in (None, "")}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
